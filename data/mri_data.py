@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 
 
 class SliceData(Dataset):
-    def __init__(self, root, transform, sample_rate=1):
+    def __init__(self, root, transform, sample_rate=1, resolution=(320,320)):
         """
         Args:
             root (pathlib.Path): Path to the dataset.
@@ -20,22 +20,30 @@ class SliceData(Dataset):
         self.transform = transform
 
         self.examples = []
+   
         files = list(pathlib.Path(root).iterdir())
         if sample_rate < 1:
             random.shuffle(files)
             num_files = round(len(files) * sample_rate)
             files = files[:num_files]
         for fname in sorted(files):
-            with h5py.File(fname, 'r') as data:
-                if data.attrs['acquisition'] == 'CORPD_FBK':   # should be 'CORPD_FBK' or 'CORPDFS_FBK'
-                    kspace = data['kspace']
-                    num_slices = kspace.shape[0]
-                    self.examples += [(fname, slice) for slice in range(5, num_slices-2)]
+            try:
+                with h5py.File(fname, 'r') as data:
+                 
+                    if data.attrs['acquisition'] == 'AXT2':   # should be 'CORPD_FBK' or 'CORPDFS_FBK'
 
+                        kspace = data['kspace']
+                        if kspace.shape[-2] < resolution[0] or kspace.shape[-1] < resolution[1]:
+                            continue
+                        num_slices = kspace.shape[0]
+                        self.examples += [(fname, slice) for slice in range(5, num_slices-2)]
+            except:
+                continue
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, i):
+
         fname, slice = self.examples[i]
         with h5py.File(fname, 'r') as data:
             kspace = data['kspace'][slice]

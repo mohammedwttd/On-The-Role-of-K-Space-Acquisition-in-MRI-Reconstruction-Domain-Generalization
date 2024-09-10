@@ -6,6 +6,7 @@ from models.rec_models.complex_unet import ComplexUnetModel
 import data.transforms as transforms
 from pytorch_nufft.nufft import nufft, nufft_adjoint
 import numpy as np
+from WaveformProjection.run_projection import proj_handler
 import matplotlib.pylab as P
 
 
@@ -44,7 +45,7 @@ class Subsampling_Layer(nn.Module):
         self.x = torch.nn.Parameter(x, requires_grad=bool(int(trajectory_learning)))
         return
 
-    def __init__(self, decimation_rate, res,trajectory_learning,initialization,n_shots,interp_gap,SNR=False):
+    def __init__(self, decimation_rate, res,trajectory_learning,initialization,n_shots,interp_gap,SNR=False, projection_iters=100):
         super().__init__()
 
         self.decimation_rate=decimation_rate
@@ -53,6 +54,7 @@ class Subsampling_Layer(nn.Module):
         self.initilaize_trajectory(trajectory_learning, initialization, n_shots)
         self.SNR=SNR
         self.interp_gap = interp_gap
+        self.iters = projection_iters
 
     def forward(self, input):
         # interpolate
@@ -60,9 +62,9 @@ class Subsampling_Layer(nn.Module):
             t = torch.arange(0, self.x.shape[1], device=self.x.device).float()
             t1 = t[::self.interp_gap]
             x_short = self.x[:, ::self.interp_gap, :]
-            for shot in range(x_short.shape[0]):
-                for d in range(2):
-                    self.x.data[shot, :, d] = self.interp(t1, x_short[shot, :, d], t)
+            
+            self.x.data = proj_handler(self.x.data, num_iters=self.iters)
+            
 
         x_full = self.x.reshape(-1, 2)
         input = input.permute(0, 1, 4, 2, 3)
