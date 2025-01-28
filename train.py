@@ -6,8 +6,7 @@ import time
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 import sys
-
-#sys.path.insert(0, '/home/tomerweiss/multiPILOT2')
+# sys.path.insert(0, '/home/tomerweiss/multiPILOT2')
 
 import numpy as np
 # np.seterr('raise')
@@ -28,23 +27,60 @@ from scipy.spatial import distance_matrix
 from tsp_solver.greedy import solve_tsp
 import scipy.io as sio
 from common.utils import get_vel_acc
-
+from common.evaluate import psnr, ssim
+from fastmri.losses import SSIMLoss
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import matplotlib.pyplot as plt
 
-class DataTransform:
+
+def save_image(source, folder_path, image_name):
+    source = source.clone()
+    for i in range(source.size(0)):  # Iterate over the batch dimension
+        image = source[i]
+        image -= image.min()
+        max_val = image.max()
+        if max_val > 0:
+            image /= max_val
+        source[i] = image
+
+    if source.dim() == 3:
+        source = source.unsqueeze(1)
+
+    grid = torchvision.utils.make_grid(source, nrow=4, pad_value=1)
+    numpy_image = grid.permute(1, 2, 0).cpu().detach().numpy()
+
+    os.makedirs(folder_path, exist_ok=True)
+
+    save_path = os.path.join(folder_path, f'{image_name}.png')
+    plt.imsave(save_path, numpy_image)
+
+
+# Example usage
+folder_path = "output_images"
+image_name = "example_image.png"
+
+
+# save_image_without_pillow(tensor_image, folder_path, image_name)
+
+class DataTransformCoils:
     def __init__(self, resolution):
         self.resolution = resolution
 
     def __call__(self, kspace, target, attrs, fname, slice):
         kspace = transforms.to_tensor(kspace)
+        #print("kspace: ",kspace.shape)
         image = transforms.ifft2_regular(kspace)
-        
         image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
-        
+        #image = image.view(-1, self.resolution, self.resolution, 2)
+        #image = transforms.root_sum_of_squares(transforms.complex_abs(image), dim=0)
+        #print("image shape: ", image.shape)
+        #save_image(image,"what_is_here",fname[1:]+str(slice))
+        #print("image: ", image.shape)
         # image = transforms.complex_abs(image)
         image, mean, std = transforms.normalize_instance(image, eps=1e-11)
+        #print(image.mean(0).shape)
         # image, mean, std = transforms.normalize_instance_per_channel(image, eps=1e-11)
         # image = image.clamp(-6, 6)
         # kspace = transforms.fft2(image)
@@ -54,30 +90,67 @@ class DataTransform:
         # # target = transforms.normalize(target, mean, std)
         # target = target.clamp(-6, 6)
         mean = std = 0
-       
-        if target.shape[1]!=self.resolution:
-            target = transforms.center_crop(target,(self.resolution, self.resolution))
-        return image.mean(0), target, mean, std, attrs['norm'].astype(np.float32)
+
+
+
+        if target.shape[1] != self.resolution:
+            target = transforms.center_crop(target, (self.resolution, self.resolution))
+        return image , target, mean, std, attrs['norm'].astype(np.float32)
+
+class DataTransform:
+    def __init__(self, resolution):
+        self.resolution = resolution
+
+    def __call__(self, kspace, target, attrs, fname, slice):
+        kspace = transforms.to_tensor(kspace)
+        #print("kspace: ",kspace.shape)
+        image = transforms.ifft2_regular(kspace)
+        image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
+        #image = image.view(-1, self.resolution, self.resolution, 2)
+        #image = transforms.root_sum_of_squares(transforms.complex_abs(image), dim=0)
+        #print("image shape: ", image.shape)
+        #save_image(image,"what_is_here",fname[1:]+str(slice))
+        #print("image: ", image.shape)
+        # image = transforms.complex_abs(image)
+        image, mean, std = transforms.normalize_instance(image, eps=1e-11)
+        #print(image.mean(0).shape)
+        # image, mean, std = transforms.normalize_instance_per_channel(image, eps=1e-11)
+        # image = image.clamp(-6, 6)
+        # kspace = transforms.fft2(image)
+
+        target = transforms.to_tensor(target)
+        target, mean, std = transforms.normalize_instance(target, eps=1e-11)
+        # # target = transforms.normalize(target, mean, std)
+        # target = target.clamp(-6, 6)
+        mean = std = 0
+
+
+
+        if target.shape[1] != self.resolution:
+            target = transforms.center_crop(target, (self.resolution, self.resolution))
+        return image.mean(0) , target, mean, std, attrs['norm'].astype(np.float32)
 
 
 def create_datasets(args):
+    print(args.data_path / f'multicoil_train', flush=True)
+    print(args.data_path / f'multicoil_val', flush=True)
     train_data = SliceData(
-        root=args.data_path,
+        root=args.data_path / f'multicoil_train',
         transform=DataTransform(args.resolution),
         sample_rate=args.sample_rate)
-    
+
     dev_data = SliceData(
-        root=args.data_path, ###THIS IS ONLY FOR DEBUGGING - WHEN WE HAVE FULL DATA CHANGE TO VAL SET,
+        root=args.data_path / f'multicoil_val',
+        ###THIS IS ONLY FOR DEBUGGING - WHEN WE HAVE FULL DATA CHANGE TO VAL SET,
         transform=DataTransform(args.resolution),
         sample_rate=args.sample_rate)
-    
+
     return dev_data, train_data
 
 
 def create_data_loaders(args):
- 
     dev_data, train_data = create_datasets(args)
-    display_data = [dev_data[i] for i in range(0, len(dev_data), len(dev_data) // 16)]
+    display_data = [dev_data[i] for i in range(0, len(dev_data), 1 if len(dev_data) // 16 == 0 else len(dev_data) // 16)]
 
     train_loader = DataLoader(
         dataset=train_data,
@@ -94,7 +167,7 @@ def create_data_loaders(args):
     )
     display_loader = DataLoader(
         dataset=display_data,
-        batch_size=16,
+        batch_size=args.batch_size,
         num_workers=20,
         pin_memory=True,
     )
@@ -108,11 +181,11 @@ def tsp_solver(x):
     return x[t, :]
 
 
-def train_epoch(args, epoch, model, data_loader, optimizer, writer):
+def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
     avg_loss = 0.
     if epoch == args.TSP_epoch and args.TSP:
-        x = model.get_trajectory()
+        x = model.module.get_trajectory()
         x = x.detach().cpu().numpy()
         for shot in range(x.shape[0]):
             x[shot, :, :] = tsp_solver(x[shot, :, :])
@@ -120,9 +193,9 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer):
         writer.add_figure('TSP_Trajectory', plot_trajectory(x), epoch)
         writer.add_figure('TSP_Acc', plot_acc(a, args.a_max), epoch)
         writer.add_figure('TSP_Vel', plot_acc(v, args.v_max), epoch)
-        np.save('trajTSP',x)
+        np.save('trajTSP', x)
         with torch.no_grad():
-            model.subsampling.x.data = torch.tensor(x, device='cuda')
+            model.module.subsampling.x.data = torch.tensor(x, device='cuda')
         args.a_max *= 2
         args.v_max *= 2
         args.vel_weight = 1e-3
@@ -155,76 +228,123 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer):
     #     args.acc_weight *= 10
     if args.TSP:
         if epoch < args.TSP_epoch:
-            model.subsampling.interp_gap = 1
+            model.module.subsampling.interp_gap = 1
         elif epoch < 10 + args.TSP_epoch:
-            model.subsampling.interp_gap = 10
+            model.module.subsampling.interp_gap = 10
             v0 = args.gamma * args.G_max * args.FOV * args.dt
             a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-            args.a_max -= a0/args.TSP_epoch
-            args.v_max -= v0/args.TSP_epoch
+            args.a_max -= a0 / args.TSP_epoch
+            args.v_max -= v0 / args.TSP_epoch
         elif epoch == 10 + args.TSP_epoch:
-            model.subsampling.interp_gap = 10
+            model.module.subsampling.interp_gap = 10
             v0 = args.gamma * args.G_max * args.FOV * args.dt
             a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
             args.a_max -= a0 / args.TSP_epoch
             args.v_max -= v0 / args.TSP_epoch
         elif epoch == 15 + args.TSP_epoch:
-            model.subsampling.interp_gap = 10
+            model.module.subsampling.interp_gap = 10
             v0 = args.gamma * args.G_max * args.FOV * args.dt
             a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
             args.a_max -= a0 / args.TSP_epoch
             args.v_max -= v0 / args.TSP_epoch
         elif epoch == 20 + args.TSP_epoch:
-            model.subsampling.interp_gap = 10
+            model.module.subsampling.interp_gap = 10
             args.vel_weight *= 10
             args.acc_weight *= 10
         elif epoch == 23 + args.TSP_epoch:
-            model.subsampling.interp_gap = 5
+            model.module.subsampling.interp_gap = 5
             args.vel_weight *= 10
             args.acc_weight *= 10
         elif epoch == 25 + args.TSP_epoch:
-            model.subsampling.interp_gap = 1
+            model.module.subsampling.interp_gap = 1
             args.vel_weight *= 10
             args.acc_weight *= 10
     else:
         if epoch < 10:
-            model.subsampling.interp_gap = 50
+            model.module.subsampling.interp_gap = 50
         elif epoch == 10:
-            model.subsampling.interp_gap = 30
+            model.module.subsampling.interp_gap = 30
         elif epoch == 15:
-            model.subsampling.interp_gap = 20
+            model.module.subsampling.interp_gap = 20
         elif epoch == 20:
-            model.subsampling.interp_gap = 10
+            model.module.subsampling.interp_gap = 10
         elif epoch == 23:
-            model.subsampling.interp_gap = 5
+            model.module.subsampling.interp_gap = 5
         elif epoch == 25:
-            model.subsampling.interp_gap = 1
+            model.module.subsampling.interp_gap = 1
 
     start_epoch = start_iter = time.perf_counter()
     print(f'a_max={args.a_max}, v_max={args.v_max}')
-    
+
     for iter, data in enumerate(data_loader):
+        torch.cuda.empty_cache()
         optimizer.zero_grad()
-       
+
         input, target, mean, std, norm = data
         input = input.to(args.device)
         target = target.to(args.device)
 
-        output = model(input.unsqueeze(1)).squeeze()
+        output = model(input.unsqueeze(1))
 
-
-        x = model.get_trajectory()
+        x = model.module.get_trajectory()
         v, a = get_vel_acc(x)
-        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs()+1e-8, 2)))
-        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max).abs()+1e-8, 2)))
+        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
+        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max).abs() + 1e-8, 2)))
 
-        rec_loss = F.l1_loss(output, target)
+        #print(optimizer)
+        if epoch <= 10:
+            vel_weight = 1e-3
+        elif epoch <= 20:
+            vel_weight = 1e-2
+        elif epoch <= 30:
+            vel_weight = 1e-1
+
+        # recons = output.to('cpu').squeeze(1).view(target.shape)
+        # recons = transforms.complex_abs(recons)  # complex to real
+        #r econs = recons.squeeze()
+        #l1_loss = F.l1_loss(output, target)
+        tmp = 320
+        #print("output: ", target.unsqueeze(0).shape)
+        #target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (tmp, tmp))
+        #save_image(subsampled.view(-1, 320, 320), f"Images_{args.model}/{args.test_name}/{epoch}", f"{iter}_coil_images")
+        save_image(torch.stack((output.view(-1, tmp, tmp),
+                                target.view(-1, tmp, tmp)))
+                                .view(-1,tmp, tmp),
+                   f"Images_{args.model}/{args.test_name}/{epoch}", f"{iter}")
+        #save_image(target, "stam", "expected", iter)
+
+        data_min = target.min()
+        data_max = target.max()
+        target_normalized = (target - data_min) / (data_max - data_min)
+        output_normalized = (output - data_min) / (data_max - data_min)
+
+        #mse_loss = F.mse_loss(output, target)
+        # print(target.shape, recons.shape)
+        # psnr_loss = -psnr(target.to('cpu').detach().numpy(), recons.detach().numpy())
+        #print(target.shape, output.shape)
+        # recons = output.to('cpu').squeeze(1).view(target.shape)
+        # recons = transforms.complex_abs(recons)  # complex to real
+        # recon = recons.squeeze()
+        # print(output.shape, target.shape)
+        loss_l1 = F.l1_loss(output, target)
+        # mse_loss = F.mse_loss(output, target)
+        # recons = recons.view(target.shape)
+        # ssim_loss = 1 - ssim(target.numpy(), output.numpy())
+        #print("output: ", output_normalized.min(), output_normalized.max())
+        #print("target: ", target_normalized.min(), target_normalized.max())
+        #ssim_loss_fastmri = SSIMLoss().to(args.device)(output_normalized.unsqueeze(0).unsqueeze(0), target_normalized.unsqueeze(0), result)
+        # print("recon: ", recons, "target: ", target, "\n\n")
+        #SSIM = ssim(target.reshape(-1,320,320).to('cpu').detach().numpy(), output.reshape(-1,320,320).to('cpu').detach().numpy())
+
+        #print(SSIM,ssim_loss_fastmri, 1 - SSIMLoss().to(args.device)(output.unsqueeze(0).unsqueeze(0), target.unsqueeze(0), target.max().reshape(-1,1,1,1)))
+        rec_loss = loss_l1# SSIMLoss().to(args.device)(output, target, data_range) # F.l1_loss(output, target)
         if args.TSP and epoch < args.TSP_epoch:
             loss = args.rec_weight * rec_loss
         else:
-            loss = rec_loss#args.rec_weight * rec_loss + args.vel_weight * vel_loss + args.acc_weight * acc_loss
+            loss = args.rec_weight * rec_loss + args.vel_weight * vel_loss + args.acc_weight * acc_loss
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
         optimizer.step()
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
@@ -236,40 +356,58 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer):
                 f'Iter = [{iter:4d}/{len(data_loader):4d}] '
                 f'Loss = {loss.item():.4g} Avg Loss = {avg_loss:.4g} '
                 f'rec_loss: {rec_loss:.4g}, vel_loss: {vel_loss:.4g}, acc_loss: {acc_loss:.4g}'
+
             )
         start_iter = time.perf_counter()
+    if scheduler:
+        scheduler.step()
     return avg_loss, time.perf_counter() - start_epoch
 
 
 def evaluate(args, epoch, model, data_loader, writer):
     model.eval()
     losses = []
+    psnr_l = []
+    ssim_l = []
+
     start = time.perf_counter()
     with torch.no_grad():
-        if epoch != 0:
+        if epoch > 0:
             for iter, data in enumerate(data_loader):
                 input, target, mean, std, norm = data
                 input = input.to(args.device)
                 target = target.to(args.device)
+                tmp = 320
+                target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (tmp, tmp))
 
-                output = model(input.unsqueeze(1)).squeeze()
-                
-                loss = F.l1_loss(output, target)
+                output = model(input.unsqueeze(1))
+                recons = output.to('cpu').squeeze(1).view(target.shape)
+                # recons = transforms.complex_abs(recons)  # complex to real
+                recons = recons.squeeze()
+                loss = F.l1_loss(output.squeeze(), target)
                 losses.append(loss.item())
+                target = target.view(-1,tmp,tmp)
+                recons = recons.view(target.shape)
+                #print(target.shape, recons.shape)
 
-            x = model.get_trajectory()
-            v, a = get_vel_acc(x)
-            acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max), 2)))
-            vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max), 2)))
-            rec_loss = np.mean(losses)
+                psnr_l.append(psnr(target.to('cpu').numpy(), recons.numpy()))
+                ssim_l.append(ssim(target.to('cpu').numpy(), recons.numpy()))
 
-            writer.add_scalar('Rec_Loss', rec_loss, epoch)
-            writer.add_scalar('Acc_Loss', acc_loss.detach().cpu().numpy(), epoch)
-            writer.add_scalar('Vel_Loss', vel_loss.detach().cpu().numpy(), epoch)
-            writer.add_scalar('Total_Loss',
-                              rec_loss + acc_loss.detach().cpu().numpy() + vel_loss.detach().cpu().numpy(), epoch)
+        print(
+            f'PSNR: {np.mean(psnr_l):.2f} +- {np.std(psnr_l):.2f}, SSIM: {np.mean(ssim_l):.4f} +- {np.std(ssim_l):.4f}')
+        x = model.module.get_trajectory()
+        v, a = get_vel_acc(x)
+        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max), 2)))
+        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max), 2)))
+        rec_loss = np.mean(losses)
 
-        x = model.get_trajectory()
+        writer.add_scalar('Rec_Loss', rec_loss, epoch)
+        writer.add_scalar('Acc_Loss', acc_loss.detach().cpu().numpy(), epoch)
+        writer.add_scalar('Vel_Loss', vel_loss.detach().cpu().numpy(), epoch)
+        writer.add_scalar('Total_Loss',
+                          rec_loss + acc_loss.detach().cpu().numpy() + vel_loss.detach().cpu().numpy(), epoch)
+
+        x = model.module.get_trajectory()
         v, a = get_vel_acc(x)
         if args.TSP and epoch < args.TSP_epoch:
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
@@ -326,6 +464,7 @@ def visualize(args, epoch, model, data_loader, writer):
 
     model.eval()
     with torch.no_grad():
+        print("entered visualize: ")
         for iter, data in enumerate(data_loader):
             input, target, mean, std, norm = data
             input = input.to(args.device)
@@ -333,18 +472,19 @@ def visualize(args, epoch, model, data_loader, writer):
 
             save_image(target, 'Target')
             if epoch != 0:
-                output = model(input.clone())
+                print(input.unsqueeze(1).shape)
+                output = model(input.unsqueeze(1))
                 # output = transforms.complex_abs(output)  # complex to real
                 # output = transforms.root_sum_of_squares(output, dim=1).unsqueeze(1)
 
-                corrupted = model.subsampling(input)
-                corrupted = corrupted[..., 0]  # complex to real
-                cor_all = transforms.root_sum_of_squares(corrupted,dim=1).unsqueeze(1)
+                # corrupted = model.module.subsampling(input)
+                # corrupted = corrupted[..., 0]  # complex to real
+                # cor_all = transforms.root_sum_of_squares(corrupted, dim=1).unsqueeze(1)
 
                 save_image(output, 'Reconstruction')
-                save_image(corrupted[:, 0:1, :, :], 'Corrupted0')
-                save_image(corrupted[:, 1:2, :, :], 'Corrupted1')
-                save_image(cor_all, 'Corrupted')
+                # save_image(corrupted[:, 0:1, :, :], 'Corrupted0')
+                # save_image(corrupted[:, 1:2, :, :], 'Corrupted1')
+                # save_image(cor_all, 'Corrupted')
                 save_image(torch.abs(target - output), 'Error')
             break
 
@@ -378,7 +518,8 @@ def build_model(args):
         initialization=args.initialization,
         SNR=args.SNR,
         n_shots=args.n_shots,
-        interp_gap=args.interp_gap
+        interp_gap=args.interp_gap,
+        type=args.model
     ).to(args.device)
     return model
 
@@ -397,16 +538,41 @@ def load_model(checkpoint_file):
 
 
 def build_optim(args, model):
-    optimizer = torch.optim.Adam([{'params': model.subsampling.parameters(), 'lr': args.sub_lr},
-                                  {'params': model.reconstruction_model.parameters()}], args.lr)
+    optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
+                                  {'params': model.module.reconstruction_model.parameters()}], args.lr)
     return optimizer
 
 
+def eval(args, model, data_loader):
+    model.eval()
+    psnr_l = []
+    ssim_l = []
+    with torch.no_grad():
+        for (input, target, mean, std, norm) in data_loader:
+            input = input.to(args.device)
+            recons = model(input.unsqueeze(1)).to('cpu').squeeze(1)
+            # recons = transforms.complex_abs(recons)  # complex to real
+            recons = recons.squeeze()
+            target = target.to('cpu')
+
+            psnr_l.append(psnr(target.numpy(), recons.numpy()))
+            ssim_l.append(ssim(target.numpy(), recons.numpy()))
+
+    print(f'PSNR: {np.mean(psnr_l):.2f} +- {np.std(psnr_l):.2f}, SSIM: {np.mean(ssim_l):.4f} +- {np.std(ssim_l):.4f}')
+    return
+
 def train():
+    import torch
+    if torch.cuda.is_available():
+        print(f"CUDA Device Name: {torch.cuda.get_device_name(0)}")  # 0 is the index of the first GPU
+    else:
+        print("CUDA device not available")
+    torch.cuda.empty_cache()
+    print("started training", flush=True)
     args = create_arg_parser().parse_args()
- 
+
     args.v_max = args.gamma * args.G_max * args.FOV * args.dt
-    args.a_max = args.gamma * args.S_max * args.FOV * args.dt**2 * 1e3
+    args.a_max = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
     # print(args.v_max)
     # print(args.a_max)
     args.exp_dir = f'summary/{args.test_name}'
@@ -418,6 +584,7 @@ def train():
     with open(args.exp_dir + '/args.txt', "w") as text_file:
         print(vars(args), file=text_file)
 
+    print(args.test_name, flush=True)
     args.checkpoint = f'summary/{args.test_name}/model.pt'
     if args.resume:
         checkpoint, model, optimizer = load_model(args.checkpoint)
@@ -432,20 +599,29 @@ def train():
         optimizer = build_optim(args, model)
         best_dev_loss = 1e9
         start_epoch = 0
+
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer_rec, max_lr=args.lr,
+    #                                          total_steps=num_epochs, pct_start=0.1,
+    #                                          anneal_strategy='linear',
+    #                                          cycle_momentum=False,
+    #                                          base_momentum=0., max_momentum=0., div_factor=0.1 * num_epochs,
+    #                                          final_div_factor=9)
+
     logging.info(args)
     # logging.info(model)
 
     train_loader, dev_loader, display_loader = create_data_loaders(args)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
     #visualize(args, 0, model, display_loader, writer)
-
+    print("started mid point", flush=True)
     for epoch in range(start_epoch, args.num_epochs):
+        print("epoch: ", epoch, "started", flush=True)
         # scheduler.step(epoch)
         # if epoch>=args.TSP_epoch:
         #     optimizer.param_groups[0]['lr']=0.001
         #     optimizer.param_groups[1]['lr'] = 0.001
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer)
+        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, None)
         dev_loss, dev_time = evaluate(args, epoch + 1, model, dev_loader, writer)
         #visualize(args, epoch + 1, model, display_loader, writer)
 
@@ -463,6 +639,7 @@ def train():
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
         )
     print(args.test_name)
+    eval(args, model, dev_loader)
     print(f'Training done, best epoch: {best_epoch}')
     writer.close()
 
@@ -477,7 +654,7 @@ def create_arg_parser():
                              '"--checkpoint" should be set with this')
     parser.add_argument('--checkpoint', type=str, default='summary/test/model.pt',
                         help='Path to an existing checkpoint. Used along with "--resume"')
-    parser.add_argument('--report-interval', type=int, default=100, help='Period of loss reporting')
+    parser.add_argument('--report-interval', type=int, default=1, help='Period of loss reporting')
 
     # model parameters
     parser.add_argument('--num-pools', type=int, default=4, help='Number of U-Net pooling layers')
@@ -527,6 +704,8 @@ def create_arg_parser():
                         help='Number of shots')
     parser.add_argument('--interp_gap', type=int, default=10,
                         help='number of interpolated points between 2 parameter points in the trajectory')
+    parser.add_argument('--model', type=str, default='Unet',
+                        help='the model type of the reconstruction net')
     return parser
 
 
