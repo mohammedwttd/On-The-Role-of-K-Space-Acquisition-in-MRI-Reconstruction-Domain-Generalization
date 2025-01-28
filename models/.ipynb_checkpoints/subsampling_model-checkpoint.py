@@ -61,7 +61,7 @@ class Subsampling_Layer(nn.Module):
 
     def initilaize_trajectory(self, trajectory_learning, initialization, n_shots):
         # x = torch.zeros(self.num_measurements, 2)
-        sampel_per_shot = 3001 # TODO, try to increase this (instead of #of shots)
+        sampel_per_shot = 3001
         if initialization == 'spiral':
             x = np.load(f'spiral/{n_shots}int_spiral_low.npy')
             x = torch.tensor(x[:, :sampel_per_shot, :]).float()
@@ -116,7 +116,7 @@ class Subsampling_Layer(nn.Module):
 
         # self.x.data = proj_handler(self.x.data, num_iters=self.iters)
 
-        x_full = self.x.reshape(-1,2)
+        x_full = self.x.reshape(-1,3001,2)
         # TODO: understand why the permute is needed
         input = input.permute(0, 1, 4, 2, 3)
         sub_ksp = nufft(input, x_full)
@@ -124,9 +124,17 @@ class Subsampling_Layer(nn.Module):
             noise_amp = 0.001
             noise = noise_amp * torch.randn(sub_ksp.shape)
             sub_ksp = sub_ksp + noise.to(sub_ksp.device)
+        #print(sub_ksp.shape)
+        #print(sub_ksp)
         output = nufft_adjoint(sub_ksp, x_full, input.shape)
         output = output.permute(0, 1, 3, 4, 2)
-        return output
+        #print(output.shape, input.shape)
+        #mask = transforms.fft2(output) - transforms.fft2(input.permute(0, 1, 3, 4, 2))
+        #print(mask.min(), mask.max())
+        #print(transforms.fft2(output) - transforms.fft2(input.permute(0, 1, 3, 4, 2)))
+        #mask = (transforms.fft2(output) - transforms.fft2(input.permute(0, 1, 3, 4, 2)) < 1).float()
+        #print(mask.size)
+        return output#, mask
 
     def get_trajectory(self):
         return self.x
@@ -254,6 +262,8 @@ class HUMUSVarNet(nn.Module):
             Refined k-space data.
         """
         image = transforms.ifft2_regular(self.reconstruction_model(kspace, ref_kspace)).view(-1,1,320,320,2)#.permute(0, 3, 1, 2)
+        #print(mid.shape)
+        #print(transforms.complex_abs(image).shape)
         return transforms.root_sum_of_squares(transforms.complex_abs(image), dim=1)
 
 
@@ -283,13 +293,33 @@ class Subsampling_Model(nn.Module):
             )
              # ReconNet(net)
         elif type == 'Unet':
+            print("got here")
             self.reconstruction_model = fastmri.models.Unet(in_chans, out_chans, chans, num_pool_layers, drop_prob)
         else:
-            humusBlock = HUMUSBlock(use_checkpoint=False, num_cascades=4, img_size=[320, 320], window_size=4,
-                                mask_center=False, num_adj_slices=1, in_chans=2, out_chans = 1)
-            self.reconstruction_model = humusBlock
+            humusNet = HUMUSNet(use_checkpoint=False, num_cascades=4, img_size=[320, 320], window_size=4,
+                                mask_center=False,num_adj_slices=1)
+            self.reconstruction_model = humusNet
+            self.mask = nn.Parameter(torch.ones((320, 320), dtype=torch.float32))
 
+    def subsample_and_stack(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Applies subsampling to each coil's k-space measurements and stacks the results.
 
+        Args:
+            input_tensor (torch.Tensor): A tensor of shape (num_coils, ...) where each coil's
+                                         measurements are independently subsampled.
+
+        Returns:
+            torch.Tensor: A tensor of shape (num_coils, 1, ...) with each coil's subsampled result.
+        """
+        # Apply subsampling for each coil and stack along the first dimension
+        print(input_tensor.shape)
+        subsampled_results = [self.subsampling(input_tensor[i]).unsqueeze(0) for i in range(input_tensor.shape[0])]
+
+        # Stack the results along the first dimension
+        stacked_results = torch.cat(subsampled_results, dim=0)
+
+        return stacked_results.unsqueeze(1)
 
     def forward(self, input):
         if self.type == "vit":
@@ -303,14 +333,18 @@ class Subsampling_Model(nn.Module):
             input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=0).unsqueeze(0).unsqueeze(0)
             return self.reconstruction_model(input, None)
         elif self.type == 'Unet':
-            input = self.subsampling(input)
-            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=1).unsqueeze(1)
-            output = self.reconstruction_model(input).reshape(-1, 320, 320)
-            return output
+            input = self.subsampling(input.squeeze(0)).reshape(-1,1,320,320,2)
+            alsoReturn = transforms.complex_abs(input).reshape(-1,320,320)
+            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=0)
+            output = self.reconstruction_model(input.unsqueeze(0)).reshape(-1, 320, 320)
+            return output, alsoReturn
         elif self.type == "humus":
-            input = self.subsampling(input).squeeze(0).permute(0, 3, 1, 2)
-            output = self.reconstruction_model(input)#.permute(0, 2, 3, 1)
-            #output = transforms.root_sum_of_squares(transforms.complex_abs(output), dim=0).unsqueeze(1)
-            return output.reshape(-1, 320, 320)
+            input = input.squeeze(0)
+            print(input.shape)
+            input = self.subsampling(input).squeeze()
+            kspace = transforms.fft2(input).unsqueeze(0).reshape(1,-1,320,320,2)
+            mask = torch.sigmoid(self.mask) > 0.5
+            out =  self.reconstruction_model(kspace.to(input.device), mask.to(input.device).bool())
+            return out
     def get_trajectory(self):
         return self.subsampling.get_trajectory()
