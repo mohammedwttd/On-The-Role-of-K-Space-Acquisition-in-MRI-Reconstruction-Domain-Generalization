@@ -2,10 +2,6 @@ import pathlib
 import random
 import h5py
 from torch.utils.data import Dataset
-import matplotlib.pyplot as plt
-import torchvision
-import os
-import torch
 
 
 class SliceData(Dataset):
@@ -42,16 +38,16 @@ class SliceData(Dataset):
                         kspace = data['kspace']
                         if kspace.shape[-2] < resolution[0] or kspace.shape[-1] < resolution[1]:
                             continue
-                        num_slices = kspace.shape[0]
-                        self.examples += [(fname, slice) for slice in range(5, num_slices-2)]
-            except Exception as e:
+
+                        self.examples += [fname]
+            except:
                 continue
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, i):
-        fname, slice = self.examples[i]
+        fname = self.examples[i]
         with h5py.File(fname, 'r') as data:
-            kspace = data['kspace'][slice]
-            target = data['reconstruction_rss'][slice] if 'reconstruction_rss' in data else None
+            kspace = data['kspace']
+            target = data['reconstruction_rss'] if 'reconstruction_rss' in data else None
             return self.transform(kspace, target, data.attrs, fname.name, slice)
