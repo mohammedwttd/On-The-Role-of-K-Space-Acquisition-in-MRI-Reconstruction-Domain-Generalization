@@ -181,6 +181,7 @@ def tsp_solver(x):
     return x[t, :]
 
 
+
 def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
     avg_loss = 0.
@@ -307,11 +308,11 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         #print("output: ", target.unsqueeze(0).shape)
         #target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (tmp, tmp))
         #save_image(subsampled.view(-1, 320, 320), f"Images_{args.model}/{args.test_name}/{epoch}", f"{iter}_coil_images")
-        save_image(torch.stack((output.view(-1, tmp, tmp),
-                                target.view(-1, tmp, tmp)))
-                                .view(-1,tmp, tmp),
-                   f"Images_{args.model}/{args.test_name}/{epoch}", f"{iter}")
-        #save_image(target, "stam", "expected", iter)
+
+        #save_image(torch.stack((output.view(-1, tmp, tmp),
+        #                            target.view(-1, tmp, tmp)))
+        #                            .view(-1,tmp, tmp),
+        #               f"../../Images_{args.model}/{args.test_name}/{epoch}", f"{iter}")
 
         data_min = target.min()
         data_max = target.max()
@@ -337,7 +338,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         #SSIM = ssim(target.reshape(-1,320,320).to('cpu').detach().numpy(), output.reshape(-1,320,320).to('cpu').detach().numpy())
 
         #print(SSIM,ssim_loss_fastmri, 1 - SSIMLoss().to(args.device)(output.unsqueeze(0).unsqueeze(0), target.unsqueeze(0), target.max().reshape(-1,1,1,1)))
-        rec_loss = loss_l1# SSIMLoss().to(args.device)(output, target, data_range) # F.l1_loss(output, target)
+        rec_loss = loss_l1 #+ dcLoss # SSIMLoss().to(args.device)(output, target, data_range) # F.l1_loss(output, target)
+        #d_N = compute_dc_factors(input, model.get_trajectory().reshape(-1, 2), num_iterations=10)
         if args.TSP and epoch < args.TSP_epoch:
             loss = args.rec_weight * rec_loss
         else:
@@ -519,7 +521,7 @@ def build_model(args):
         SNR=args.SNR,
         n_shots=args.n_shots,
         interp_gap=args.interp_gap,
-        type=args.model
+        model=args.model
     ).to(args.device)
     return model
 
@@ -705,7 +707,7 @@ def create_arg_parser():
     parser.add_argument('--interp_gap', type=int, default=10,
                         help='number of interpolated points between 2 parameter points in the trajectory')
     parser.add_argument('--model', type=str, default='Unet',
-                        help='the model type of the reconstruction net')
+                        help='the model type and params of the reconstruction net')
     return parser
 
 

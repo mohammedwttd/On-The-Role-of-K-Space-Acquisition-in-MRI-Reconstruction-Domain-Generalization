@@ -13,6 +13,7 @@ import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from einops import rearrange
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -35,29 +36,14 @@ class Mlp(nn.Module):
 def window_partition(x, window_size):
     """
     Args:
-        x: Tensor of shape (B, H, W, C)
-        window_size (int): Size of the window.
+        x: (B, H, W, C)
+        window_size (int): window size
     Returns:
-        windows: Tensor of shape (num_windows * B, window_size, window_size, C)
+        windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
-    #print(B, H, W, C, window_size)
-
-    # Check if padding is needed
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
-
-    # Apply padding if necessary
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))  # Pad along height and width only
-
-    # Updated dimensions
-    B, H_padded, W_padded, C = x.shape
-
-    # Reshape and create windows
-    x = x.view(B, H_padded // window_size, window_size, W_padded // window_size, window_size, C)
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-
     return windows
 
 
@@ -160,7 +146,8 @@ class WindowAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-    
+
+
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
     Args:
@@ -280,7 +267,8 @@ class SwinTransformerBlock(nn.Module):
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-    
+
+
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
     Args:
@@ -321,13 +309,14 @@ class PatchMerging(nn.Module):
 
     def extra_repr(self) -> str:
         return f"input_resolution={self.input_resolution}, dim={self.dim}"
-    
+
+
 class PatchExpandSkip(nn.Module):
     def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.expand = nn.Linear(dim, 2*dim, bias=False)
+        self.expand = nn.Linear(dim, 2 * dim, bias=False)
         self.channel_mix = nn.Linear(dim, dim // 2, bias=False)
         self.norm = norm_layer(dim // 2)
 
@@ -341,8 +330,8 @@ class PatchExpandSkip(nn.Module):
         assert L == H * W, "input feature has wrong size"
 
         x = x.view(B, H, W, C)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=2, c=C//4)
-        x = x.view(B,-1,C//4)
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=2, c=C // 4)
+        x = x.view(B, -1, C // 4)
         x = torch.cat([x, skip], dim=-1)
         x = self.channel_mix(x)
         x = self.norm(x)
@@ -389,7 +378,7 @@ class BasicLayer(nn.Module):
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer,
-                                )
+                                 )
             for i in range(depth)])
 
         # patch merging layer
@@ -432,10 +421,10 @@ class RSTB(nn.Module):
         img_size: Input image size.
         patch_size: Patch size.
         resi_connection: The convolutional block before residual connection.
-        block_type: 
+        block_type:
             D: downsampling block,
             U: upsampling block
-            B: bottleneck block 
+            B: bottleneck block
     """
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
@@ -460,13 +449,14 @@ class RSTB(nn.Module):
                                          norm_layer=norm_layer,
                                          downsample=downsample,
                                          use_checkpoint=use_checkpoint,
-                                        )
+                                         )
 
         if resi_connection == '1conv':
             self.conv = nn.Conv2d(conv_dim, conv_dim // divide_out_ch, 3, 1, 1)
         elif resi_connection == '3conv':
             # to save parameters and memory
-            self.conv = nn.Sequential(nn.Conv2d(conv_dim, conv_dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            self.conv = nn.Sequential(nn.Conv2d(conv_dim, conv_dim // 4, 3, 1, 1),
+                                      nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                       nn.Conv2d(conv_dim // 4, conv_dim // 4, 1, 1, 0),
                                       nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                       nn.Conv2d(conv_dim // 4, conv_dim // divide_out_ch, 3, 1, 1))
@@ -477,7 +467,7 @@ class RSTB(nn.Module):
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, embed_dim=dim,
             norm_layer=None)
-        
+
         self.block_type = block_type
         if block_type == 'B':
             self.reshape = torch.nn.Identity()
@@ -492,18 +482,19 @@ class RSTB(nn.Module):
         if self.block_type == 'U':
             assert skip is not None, "Skip connection is required for patch expand"
             x = self.reshape(x, skip)
-        
+
         out = self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))
         block_out = self.patch_embed(out) + x
-        
+
         if self.block_type == 'D':
             block_out = (self.reshape(block_out), block_out)  # return skip connection
-            
+
         return block_out
+
 
 class PatchEmbed(nn.Module):
     r""" Fixed Image to Patch Embedding. Flattens image along spatial dimensions
-        without learned projection mapping. Only supports 1x1 patches. 
+        without learned projection mapping. Only supports 1x1 patches.
     Args:
         img_size (int): Image size.
         patch_size (int): Patch token size.
@@ -532,15 +523,16 @@ class PatchEmbed(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         return x
-    
+
+
 class PatchEmbedLearned(nn.Module):
     r""" Image to Patch Embedding with arbitrary patch size and learned linear projection.
     Args:
-        img_size (int): Image size.  
-        patch_size (int): Patch token size. 
-        in_chans (int): Number of input image channels. 
-        embed_dim (int): Number of linear projection output channels. 
-        norm_layer (nn.Module, optional): Normalization layer. 
+        img_size (int): Image size.
+        patch_size (int): Patch token size.
+        in_chans (int): Number of input image channels.
+        embed_dim (int): Number of linear projection output channels.
+        norm_layer (nn.Module, optional): Normalization layer.
     """
 
     def __init__(self, img_size, patch_size, in_chans, embed_dim, norm_layer=None):
@@ -571,7 +563,7 @@ class PatchEmbedLearned(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         return x
-    
+
     def patch_to_vec(self, x):
         """
         Args:
@@ -613,15 +605,16 @@ class PatchUnEmbed(nn.Module):
         B, HW, C = x.shape
         x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B Ph*Pw C
         return x
-    
+
+
 class PatchUnEmbedLearned(nn.Module):
     r""" Patch Embedding to Image with learned linear projection.
     Args:
-        img_size (int): Image size.  
+        img_size (int): Image size.
         patch_size (int): Patch token size.
-        in_chans (int): Number of input image channels. 
-        embed_dim (int): Number of linear projection output channels. 
-        norm_layer (nn.Module, optional): Normalization layer. 
+        in_chans (int): Number of input image channels.
+        embed_dim (int): Number of linear projection output channels.
+        norm_layer (nn.Module, optional): Normalization layer.
     """
 
     def __init__(self, img_size, patch_size, in_chans=None, out_chans=None, norm_layer=None):
@@ -644,57 +637,59 @@ class PatchUnEmbedLearned(nn.Module):
         x = self.proj_up(x)
         x = self.vec_to_patch(x)
         return x
-    
+
     def vec_to_patch(self, x):
         B, HW, C = x.shape
         x = x.view(B, self.patches_resolution[0], self.patches_resolution[1], C).contiguous()
-        x = x.view(B, self.patches_resolution[0], self.patch_size[0], self.patches_resolution[1], self.patch_size[1], C // (self.patch_size[0] * self.patch_size[1])).contiguous()
+        x = x.view(B, self.patches_resolution[0], self.patch_size[0], self.patches_resolution[1], self.patch_size[1],
+                   C // (self.patch_size[0] * self.patch_size[1])).contiguous()
         x = x.view(B, self.img_size[0], self.img_size[1], -1).contiguous().permute(0, 3, 1, 2)
         return x
-    
+
+
 class HUMUSBlock(nn.Module):
     r""" HUMUS-Block
     Args:
         img_size (int | tuple(int)): Input image size.
-        patch_size (int | tuple(int)): Patch size. 
-        in_chans (int): Number of input image channels. 
+        patch_size (int | tuple(int)): Patch size.
+        in_chans (int): Number of input image channels.
         embed_dim (int): Patch embedding dimension.
         depths (tuple(int)): Depth of each Swin Transformer layer in encoder and decoder paths.
         num_heads (tuple(int)): Number of attention heads in different layers of encoder and decoder.
-        window_size (int): Window size. 
+        window_size (int): Window size.
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. 
-        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. 
-        drop_rate (float): Dropout rate. 
-        attn_drop_rate (float): Attention dropout rate. 
-        drop_path_rate (float): Stochastic depth rate. 
-        norm_layer (nn.Module): Normalization layer. 
-        ape (bool): If True, add absolute position embedding to the patch embedding. 
-        patch_norm (bool): If True, add normalization after patch embedding. 
-        use_checkpoint (bool): Whether to use checkpointing to save memory. 
+        qkv_bias (bool): If True, add a learnable bias to query, key, value.
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set.
+        drop_rate (float): Dropout rate.
+        attn_drop_rate (float): Attention dropout rate.
+        drop_path_rate (float): Stochastic depth rate.
+        norm_layer (nn.Module): Normalization layer.
+        ape (bool): If True, add absolute position embedding to the patch embedding.
+        patch_norm (bool): If True, add normalization after patch embedding.
+        use_checkpoint (bool): Whether to use checkpointing to save memory.
         img_range: Image range. 1. or 255.
         resi_connection: The convolutional block before residual connection. '1conv'/'3conv'
         conv_downsample_first: use convolutional downsampling before MUST to reduce compute load on Transformers
     """
 
-    def __init__(self, 
-                 img_size, 
+    def __init__(self,
+                 img_size,
                  in_chans,
-                 patch_size=1, 
-                 embed_dim=66, 
-                 depths=[2, 2, 2], 
+                 patch_size=1,
+                 embed_dim=66,
+                 depths=[2, 2, 2],
                  num_heads=[3, 6, 12],
-                 window_size=8, 
-                 mlp_ratio=2., 
-                 qkv_bias=True, 
+                 window_size=8,
+                 mlp_ratio=2.,
+                 qkv_bias=True,
                  qk_scale=None,
                  drop_rate=0.,
-                 attn_drop_rate=0., 
+                 attn_drop_rate=0.,
                  drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, 
-                 ape=False, 
+                 norm_layer=nn.LayerNorm,
+                 ape=False,
                  patch_norm=True,
-                 img_range=1., 
+                 img_range=1.,
                  resi_connection='1conv',
                  bottleneck_depth=2,
                  bottleneck_heads=24,
@@ -713,11 +708,12 @@ class HUMUSBlock(nn.Module):
         self.window_size = window_size
         self.conv_downsample_first = conv_downsample_first
         self.no_residual_learning = no_residual_learning
-        
+
         #####################################################################################################
         ################################### 1, input block ###################################
         input_conv_dim = embed_dim
-        self.conv_first = nn.Conv2d(num_in_ch, input_conv_dim // 2 if self.conv_downsample_first else input_conv_dim, 3, 1, 1)
+        self.conv_first = nn.Conv2d(num_in_ch, input_conv_dim // 2 if self.conv_downsample_first else input_conv_dim, 3,
+                                    1, 1)
 
         #####################################################################################################
         ################################### 2, deep feature extraction ######################################
@@ -727,10 +723,10 @@ class HUMUSBlock(nn.Module):
         self.patch_norm = patch_norm
         self.num_features = int(embed_dim * 2 ** self.num_layers)
         self.mlp_ratio = mlp_ratio
-        
-        # Downsample for low-res feature extraction 
+
+        # Downsample for low-res feature extraction
         if self.conv_downsample_first:
-            img_size = [im //2 for im in img_size]
+            img_size = [im // 2 for im in img_size]
             self.conv_down_block = ConvBlock(input_conv_dim // 2, input_conv_dim, 0.0)
             self.conv_down = DownsampConvBlock(input_conv_dim, input_conv_dim)
 
@@ -750,7 +746,8 @@ class HUMUSBlock(nn.Module):
         # merge non-overlapping patches into image
         if patch_size > 1:
             self.patch_unembed = PatchUnEmbedLearned(
-                img_size=img_size, patch_size=patch_size, in_chans=embed_dim, out_chans=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+                img_size=img_size, patch_size=patch_size, in_chans=embed_dim, out_chans=embed_dim,
+                norm_layer=norm_layer if self.patch_norm else None)
         else:
             self.patch_unembed = PatchUnEmbed(
                 img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -789,27 +786,27 @@ class HUMUSBlock(nn.Module):
                          block_type='D',
                          )
             self.layers_down.append(layer)
-            
+
         # bottleneck
         dim_scaler = (2 ** self.num_layers)
         self.layer_bottleneck = RSTB(dim=int(embed_dim * dim_scaler),
-                         input_resolution=(patches_resolution[0] // dim_scaler,
-                                           patches_resolution[1] // dim_scaler),
-                         depth=bottleneck_depth,
-                         num_heads=bottleneck_heads,
-                         window_size=window_size,
-                         mlp_ratio=self.mlp_ratio,
-                         qkv_bias=qkv_bias, qk_scale=qk_scale,
-                         drop=drop_rate, attn_drop=attn_drop_rate,
-                         norm_layer=norm_layer,
-                         downsample=None,
-                         use_checkpoint=False,
-                         img_size=[im // dim_scaler for im in img_size],
-                         patch_size=1,
-                         resi_connection=resi_connection,
-                         block_type='B',
-                         )
-            
+                                     input_resolution=(patches_resolution[0] // dim_scaler,
+                                                       patches_resolution[1] // dim_scaler),
+                                     depth=bottleneck_depth,
+                                     num_heads=bottleneck_heads,
+                                     window_size=window_size,
+                                     mlp_ratio=self.mlp_ratio,
+                                     qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                     drop=drop_rate, attn_drop=attn_drop_rate,
+                                     norm_layer=norm_layer,
+                                     downsample=None,
+                                     use_checkpoint=False,
+                                     img_size=[im // dim_scaler for im in img_size],
+                                     patch_size=1,
+                                     resi_connection=resi_connection,
+                                     block_type='B',
+                                     )
+
         # decoder
         self.layers_up = nn.ModuleList()
         for i_layer in range(self.num_layers):
@@ -817,13 +814,14 @@ class HUMUSBlock(nn.Module):
             layer = RSTB(dim=int(embed_dim * dim_scaler),
                          input_resolution=(patches_resolution[0] // dim_scaler,
                                            patches_resolution[1] // dim_scaler),
-                         depth=depths[(self.num_layers-1-i_layer)],
-                         num_heads=num_heads[(self.num_layers-1-i_layer)],
+                         depth=depths[(self.num_layers - 1 - i_layer)],
+                         num_heads=num_heads[(self.num_layers - 1 - i_layer)],
                          window_size=window_size,
                          mlp_ratio=self.mlp_ratio,
                          qkv_bias=qkv_bias, qk_scale=qk_scale,
                          drop=drop_rate, attn_drop=attn_drop_rate,
-                         drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],  # no impact on SR results
+                         drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                             depths[:(self.num_layers - 1 - i_layer) + 1])],  # no impact on SR results
                          norm_layer=norm_layer,
                          downsample=None,
                          use_checkpoint=False,
@@ -832,8 +830,8 @@ class HUMUSBlock(nn.Module):
                          resi_connection=resi_connection,
                          block_type='U',
                          )
-            self.layers_up.append(layer)            
-            
+            self.layers_up.append(layer)
+
         self.norm_down = norm_layer(self.num_features)
         self.norm_up = norm_layer(self.embed_dim)
 
@@ -847,7 +845,7 @@ class HUMUSBlock(nn.Module):
                                                  nn.Conv2d(input_conv_dim // 4, input_conv_dim // 4, 1, 1, 0),
                                                  nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                                  nn.Conv2d(input_conv_dim // 4, input_conv_dim, 3, 1, 1))
-            
+
         # Upsample if needed
         if self.conv_downsample_first:
             self.conv_up_block = ConvBlock(input_conv_dim, input_conv_dim // 2, 0.0)
@@ -855,7 +853,8 @@ class HUMUSBlock(nn.Module):
 
         #####################################################################################################
         ################################ 3, output block ################################
-        self.conv_last = nn.Conv2d(input_conv_dim // 2 if self.conv_downsample_first else input_conv_dim, num_out_ch, 3, 1, 1)
+        self.conv_last = nn.Conv2d(input_conv_dim // 2 if self.conv_downsample_first else input_conv_dim, num_out_ch, 3,
+                                   1, 1)
 
         self.apply(self._init_weights)
 
@@ -878,12 +877,12 @@ class HUMUSBlock(nn.Module):
 
     def check_image_size(self, x):
         _, _, h, w = x.size()
-                         
+
         # divisible by window size
         mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
         mod_pad_w = (self.window_size - w % self.window_size) % self.window_size
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-                         
+
         # divisible by total downsampling ratio
         # this could be done more efficiently by combining the two
         total_downsamp = int(2 ** (self.num_layers - 1))
@@ -905,23 +904,22 @@ class HUMUSBlock(nn.Module):
             x, skip = layer(x, x_size=layer.input_resolution)
             skip_cons.append(skip)
         x = self.norm_down(x)  # B L C
-        
+
         # bottleneck
         x = self.layer_bottleneck(x, self.layer_bottleneck.input_resolution)
-        
+
         # decode
         for i, layer in enumerate(self.layers_up):
-            x = layer(x, x_size=layer.input_resolution, skip=skip_cons[-i-1])
+            x = layer(x, x_size=layer.input_resolution, skip=skip_cons[-i - 1])
         x = self.norm_up(x)
         x = self.patch_unembed(x, x_size)
         return x
 
     def forward(self, x):
         C, H, W = x.shape[1:]
-        #print(C, H, W)
         center_slice = (C - 1) // 2
         x = self.check_image_size(x)
-        
+
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
@@ -935,30 +933,30 @@ class HUMUSBlock(nn.Module):
 
             res = self.conv_last(res)
 
-            if self.no_residual_learning: 
+            if self.no_residual_learning:
                 x = res
             else:
                 if self.center_slice_out:
-                    x = x[:, center_slice, ...].unsqueeze(1) 
+                    x = x[:, center_slice, ...].unsqueeze(1)
                 x = x + res
         else:
             x_first = self.conv_first(x)
             res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            
-            if self.no_residual_learning: 
+
+            if self.no_residual_learning:
                 x = self.conv_last(res)
             else:
                 if self.center_slice_out:
-                    x = x[:, center_slice, ...].unsqueeze(1) 
+                    x = x[:, center_slice, ...].unsqueeze(1)
                 x = x + self.conv_last(res)
-        
+
         if self.center_slice_out:
             x = x / self.img_range + self.mean[:, center_slice, ...].unsqueeze(1)
         else:
             x = x / self.img_range + self.mean
 
         return x[:, :, :H, :W]
-    
+
 
 class ConvBlock(nn.Module):
     """
@@ -1033,7 +1031,8 @@ class TransposeConvBlock(nn.Module):
             Output tensor of shape `(N, out_chans, H*2, W*2)`.
         """
         return self.layers(image)
-    
+
+
 class DownsampConvBlock(nn.Module):
     """
     A Downsampling Convolutional Block that consists of one strided convolution

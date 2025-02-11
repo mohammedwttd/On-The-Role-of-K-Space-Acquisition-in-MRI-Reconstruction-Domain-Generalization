@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import json
 import fastmri.models
 from models.rec_models.unet_model import UnetModel
 from models.rec_models.complex_unet import ComplexUnetModel
@@ -21,7 +21,70 @@ from fastmri.data.transforms import apply_mask
 import torch
 import numpy as np
 
+import torch
 
+
+def compute_dc_loss(y_full_kspace, x_full, kspace_values, d_N):
+    """
+    Computes data consistency (DC) loss using extracted values from y_full_kspace.
+    Avoids direct subtraction to work around potential device/contiguity issues.
+    """
+    batch, coils, height, width, complex_dim = y_full_kspace.shape
+    assert complex_dim == 2, "Expected real and imaginary components in last dimension."
+
+    # Normalize coordinates
+    x_full_normalized = ((x_full + 160) / 320) * (height - 1)
+    x_rounded = torch.floor(x_full_normalized).long().clamp(0, height - 1)
+
+    # Extract values from y_full_kspace
+    real_vals = y_full_kspace[0, 0, x_rounded[:, 0], x_rounded[:, 1], 0]
+    imag_vals = y_full_kspace[0, 0, x_rounded[:, 0], x_rounded[:, 1], 1]
+
+    # Construct y_kspace_values and ensure contiguous memory
+    y_kspace_values = torch.stack([real_vals, imag_vals], dim=0)
+    y_kspace_values = y_kspace_values.unsqueeze(0).unsqueeze(0).contiguous()  # [1, 1, 2, 48016]
+
+    # Ensure device consistency
+    device = kspace_values.device
+    y_kspace_values = y_kspace_values.to(device=device, dtype=kspace_values.dtype)
+    #d_N = d_N.to(device=device, dtype=kspace_values.dtype)
+    kspace_values = kspace_values.contiguous()
+
+    dc_loss = F.l1_loss(y_kspace_values, kspace_values)
+
+    #print(f"DC Loss: {dc_loss.item()}")
+    return dc_loss
+
+
+
+
+def compute_dc_factors(input, x_full, num_iterations=10):
+    """
+    Compute data consistency (DC) factors iteratively and return DC loss.
+
+    Args:
+        input: The original measurement y (in image space) (batch_size, coils, height, width, 2)
+        x_full: The corresponding k-space sampling trajectory Ω.
+        num_iterations: Number of iterations for convergence.
+
+    Returns:
+        d_N: Final data consistency factors (same shape as input).
+        dc_loss: A scalar tensor representing the DC loss in k-space.
+    """
+    # Initialize d_0 = 1
+    d_N = torch.ones_like(input)
+
+    #for _ in range(num_iterations):
+    #    sub_ksp = nufft(d_N, x_full)  # Forward NUFFT (compute k-space)
+    #    y_k = nufft_adjoint(sub_ksp, x_full, input.shape)  # Reconstruct to image space
+    #    d_N = d_N * (y_k / d_N)  # Update DC factors
+
+    y_full_kspace = transforms.fft2(input.permute(0, 1, 3, 4, 2))
+    y_kspace = nufft(input, x_full)
+    # Compute DC loss in k-space: || d_N * (y_kspace - y_k) ||_2
+    dc_loss = compute_dc_loss(y_full_kspace, x_full, y_kspace, d_N)
+
+    return dc_loss
 
 
 class Subsampling_Layer(nn.Module):
@@ -61,7 +124,7 @@ class Subsampling_Layer(nn.Module):
 
     def initilaize_trajectory(self, trajectory_learning, initialization, n_shots):
         # x = torch.zeros(self.num_measurements, 2)
-        sampel_per_shot = 3001 # TODO, try to increase this (instead of #of shots)
+        sampel_per_shot = 6002 # TODO, try to increase this (instead of #of shots)
         if initialization == 'spiral':
             x = np.load(f'spiral/{n_shots}int_spiral_low.npy')
             x = torch.tensor(x[:, :sampel_per_shot, :]).float()
@@ -194,7 +257,7 @@ class Subsampling_Layer(nn.Module):
         return f'Subsampling_Layer'
 
 class HUMUSReconstructionModel(nn.Module):
-    def __init__(self, img_size, in_chans, out_chans, num_blocks, window_size):
+    def __init__(self, img_size, in_chans, out_chans, num_blocks, window_size, embed_dim):
         super(HUMUSReconstructionModel, self).__init__()
         self.blocks = nn.ModuleList()
         for i in range(num_blocks):
@@ -203,91 +266,44 @@ class HUMUSReconstructionModel(nn.Module):
                     img_size=img_size,
                     in_chans=in_chans if i == 0 else out_chans,
                     out_chans=out_chans,
-                    window_size=window_size
+                    window_size=window_size,
+                    embed_dim=embed_dim
                 )
             )
-        self.final_block = HUMUSBlock(
-            img_size=img_size,
-            in_chans=out_chans,
-            out_chans=1,
-            window_size=window_size
-        )
 
     def forward(self, x):
         for block in self.blocks:
             x = block(x)
-        x = self.final_block(x)
         return x
-
-
-class HUMUSVarNet(nn.Module):
-    """
-    VarNet with HUMUSBlock for all cascades, where the last cascade has `out_chans=1`.
-    """
-
-    def __init__(self, img_size, in_chans, out_chans, window_size):
-        """
-        Args:
-            img_size: Size of the input image for HUMUSBlock.
-            in_chans: Number of input channels for HUMUSBlock.
-            out_chans: Number of output channels for the last HUMUSBlock cascade.
-            window_size: Window size parameter for HUMUSBlock.
-        """
-        super().__init__()
-
-        # Define the VarNet with three cascades
-        self.reconstruction_model = VarNet(
-            num_cascades =5,
-            reg_model_fn = lambda cascade_index: (
-                HUMUSBlock(img_size=img_size, in_chans=in_chans, out_chans=out_chans, window_size=window_size)
-            ),
-        )
-        #self.tail = HUMUSBlock(img_size=img_size, in_chans=in_chans, out_chans=1, window_size=window_size)
-
-    def forward(self, kspace, ref_kspace):
-        """
-        Args:
-            kspace: Input k-space data of shape [batch_size, num_coils, height, width].
-            ref_kspace: Reference k-space data of the same shape.
-
-        Returns:
-            Refined k-space data.
-        """
-        image = transforms.ifft2_regular(self.reconstruction_model(kspace, ref_kspace)).view(-1,1,320,320,2)#.permute(0, 3, 1, 2)
-        return transforms.root_sum_of_squares(transforms.complex_abs(image), dim=1)
-
-
-
 
 class Subsampling_Model(nn.Module):
     def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob, decimation_rate, res,
-                 trajectory_learning, initialization, n_shots, interp_gap, SNR=False, type ='vit'):
+                 trajectory_learning, initialization, n_shots, interp_gap, SNR=False, model = None):
         super().__init__()
         self.subsampling = Subsampling_Layer(decimation_rate, res, trajectory_learning, initialization, n_shots,
                                              interp_gap, SNR)
-        self.type = type
-        avrg_img_size = 320
-        patch_size = 10
-        depth = 4
-        num_heads = 9
-        embed_dim = 300
-        from fastmri.data.subsample import create_mask_for_mask_type
 
-        print(self.type)
+        model_dict = json.loads(model.replace("'", '"'))
+        type = model_dict["model"]
+        self.type = type
         if type == 'vit':
+            avrg_img_size = 320
+            patch_size = 10
+            depth = 4
+            num_heads = 9
+            embed_dim = 300
             vitNet = VisionTransformer(
                 avrg_img_size=avrg_img_size,
                 patch_size=patch_size,
                 in_chans=1, embed_dim=embed_dim,
                 depth=depth, num_heads=num_heads,
             )
-             # ReconNet(net)
+            self.reconstruction_model = vitNet
         elif type == 'Unet':
             self.reconstruction_model = fastmri.models.Unet(in_chans, out_chans, chans, num_pool_layers, drop_prob)
         else:
-            humusBlock = HUMUSBlock(use_checkpoint=False, num_cascades=4, img_size=[320, 320], window_size=4,
-                                mask_center=False, num_adj_slices=1, in_chans=2, out_chans = 1)
-            self.reconstruction_model = humusBlock
+            HUMUSReconstructionNet = HUMUSReconstructionModel(img_size=model_dict["img_size"], in_chans = model_dict["in_chans"], out_chans = model_dict["out_chans"], num_blocks = model_dict["num_blocks"], window_size = model_dict["window_size"], embed_dim = model_dict["embed_dim"])
+            self.reconstruction_model = HUMUSReconstructionNet
 
 
 
@@ -308,9 +324,9 @@ class Subsampling_Model(nn.Module):
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
         elif self.type == "humus":
-            input = self.subsampling(input).squeeze(0).permute(0, 3, 1, 2)
-            output = self.reconstruction_model(input)#.permute(0, 2, 3, 1)
-            #output = transforms.root_sum_of_squares(transforms.complex_abs(output), dim=0).unsqueeze(1)
+            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=1).unsqueeze(1)
+            output = self.reconstruction_model(input)
             return output.reshape(-1, 320, 320)
+
     def get_trajectory(self):
         return self.subsampling.get_trajectory()
