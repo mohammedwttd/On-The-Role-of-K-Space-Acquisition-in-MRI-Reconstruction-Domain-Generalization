@@ -41,6 +41,7 @@ CONDA_ENV=mpilot
 sbatch \
 	-N $NUM_NODES \
 	-c $NUM_CORES \
+	-w $GPU \
 	--gres=gpu:$NUM_GPUS \
 	--job-name $JOB_NAME \
 	--mail-user $MAIL_USER \

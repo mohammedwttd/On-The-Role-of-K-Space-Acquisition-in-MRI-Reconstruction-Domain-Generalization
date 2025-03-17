@@ -70,25 +70,11 @@ class DataTransformCoils:
 
     def __call__(self, kspace, target, attrs, fname, slice):
         kspace = transforms.to_tensor(kspace)
-        #print("kspace: ",kspace.shape)
         image = transforms.ifft2_regular(kspace)
         image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
-        #image = image.view(-1, self.resolution, self.resolution, 2)
-        #image = transforms.root_sum_of_squares(transforms.complex_abs(image), dim=0)
-        #print("image shape: ", image.shape)
-        #save_image(image,"what_is_here",fname[1:]+str(slice))
-        #print("image: ", image.shape)
-        # image = transforms.complex_abs(image)
         image, mean, std = transforms.normalize_instance(image, eps=1e-11)
-        #print(image.mean(0).shape)
-        # image, mean, std = transforms.normalize_instance_per_channel(image, eps=1e-11)
-        # image = image.clamp(-6, 6)
-        # kspace = transforms.fft2(image)
-
         target = transforms.to_tensor(target)
         target, mean, std = transforms.normalize_instance(target, eps=1e-11)
-        # # target = transforms.normalize(target, mean, std)
-        # target = target.clamp(-6, 6)
         mean = std = 0
 
 
@@ -103,25 +89,11 @@ class DataTransform:
 
     def __call__(self, kspace, target, attrs, fname, slice):
         kspace = transforms.to_tensor(kspace)
-        #print("kspace: ",kspace.shape)
         image = transforms.ifft2_regular(kspace)
         image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
-        #image = image.view(-1, self.resolution, self.resolution, 2)
-        #image = transforms.root_sum_of_squares(transforms.complex_abs(image), dim=0)
-        #print("image shape: ", image.shape)
-        #save_image(image,"what_is_here",fname[1:]+str(slice))
-        #print("image: ", image.shape)
-        # image = transforms.complex_abs(image)
         image, mean, std = transforms.normalize_instance(image, eps=1e-11)
-        #print(image.mean(0).shape)
-        # image, mean, std = transforms.normalize_instance_per_channel(image, eps=1e-11)
-        # image = image.clamp(-6, 6)
-        # kspace = transforms.fft2(image)
-
         target = transforms.to_tensor(target)
         target, mean, std = transforms.normalize_instance(target, eps=1e-11)
-        # # target = transforms.normalize(target, mean, std)
-        # target = target.clamp(-6, 6)
         mean = std = 0
 
 
@@ -141,7 +113,6 @@ def create_datasets(args):
 
     dev_data = SliceData(
         root=args.data_path / f'multicoil_val',
-        ###THIS IS ONLY FOR DEBUGGING - WHEN WE HAVE FULL DATA CHANGE TO VAL SET,
         transform=DataTransform(args.resolution),
         sample_rate=args.sample_rate)
 
@@ -175,92 +146,46 @@ def create_data_loaders(args):
 
 
 def tsp_solver(x):
-    # reorder the trajectory according to the TSP solution
     d = distance_matrix(x, x)
     t = solve_tsp(d)
     return x[t, :]
 
+def optimize_trajectory(args, model):
+    if not args.trajectory_learning:
+        return
 
+    optimizer = torch.optim.Adam(model.module.parameters(), lr=1e-1)
+    a_max, v_max = args.a_max, args.v_max
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=100,
+                                                           verbose=False)
+
+    x = model.module.get_trajectory()
+    v, a = get_vel_acc(x)
+    init_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, a_max).abs() + 1e-8, 2))) + torch.sqrt(torch.sum(torch.pow(F.softshrink(v, v_max).abs() + 1e-8, 2)))
+    iteration = 0
+    while iteration < 1000:
+        optimizer.zero_grad()
+        x = model.module.get_trajectory()
+        v, a = get_vel_acc(x)
+        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, a_max).abs() + 1e-8, 2)))
+        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, v_max).abs() + 1e-8, 2)))
+        loss = acc_loss + vel_loss
+        loss.backward()
+        optimizer.step()
+
+        if acc_loss.item() <  1e-5 and vel_loss.item() < 1e-5:
+            print(f"acc_loss reached {acc_loss.item()} at iteration {iteration + 1}. Stopping training.")
+            return
+        scheduler.step(loss)
+        iteration += 1
+
+    print("Training completed!, took it from: ", init_loss," to: ", acc_loss + vel_loss)
 
 def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
     avg_loss = 0.
-    if epoch == args.TSP_epoch and args.TSP:
-        x = model.module.get_trajectory()
-        x = x.detach().cpu().numpy()
-        for shot in range(x.shape[0]):
-            x[shot, :, :] = tsp_solver(x[shot, :, :])
-        v, a = get_vel_acc(x)
-        writer.add_figure('TSP_Trajectory', plot_trajectory(x), epoch)
-        writer.add_figure('TSP_Acc', plot_acc(a, args.a_max), epoch)
-        writer.add_figure('TSP_Vel', plot_acc(v, args.v_max), epoch)
-        np.save('trajTSP', x)
-        with torch.no_grad():
-            model.module.subsampling.x.data = torch.tensor(x, device='cuda')
-        args.a_max *= 2
-        args.v_max *= 2
-        args.vel_weight = 1e-3
-        args.acc_weight = 1e-3
 
-    # if epoch == 30:
-    #     v0 = args.gamma * args.G_max * args.FOV * args.dt
-    #     a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-    #     args.a_max = a0 *1.5
-    #     args.v_max = v0 *1.5
-
-    # if args.TSP and epoch > args.TSP_epoch and epoch<=args.TSP_epoch*2:
-    #     v0 = args.gamma * args.G_max * args.FOV * args.dt
-    #     a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-    #     args.a_max -= a0/args.TSP_epoch
-    #     args.v_max -= v0/args.TSP_epoch
-    #
-    # if args.TSP and epoch==args.TSP_epoch*2:
-    #     v0 = args.gamma * args.G_max * args.FOV * args.dt
-    #     a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-    #     args.a_max = a0
-    #     args.v_max = v0
-    #     args.vel_weight *= 10
-    #     args.acc_weight *= 10
-    # if args.TSP and epoch==args.TSP_epoch*2+10:
-    #     args.vel_weight *= 10
-    #     args.acc_weight *= 10
-    # if args.TSP and epoch==args.TSP_epoch*2+20:
-    #     args.vel_weight *= 10
-    #     args.acc_weight *= 10
-    if args.TSP:
-        if epoch < args.TSP_epoch:
-            model.module.subsampling.interp_gap = 1
-        elif epoch < 10 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 10
-            v0 = args.gamma * args.G_max * args.FOV * args.dt
-            a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-            args.a_max -= a0 / args.TSP_epoch
-            args.v_max -= v0 / args.TSP_epoch
-        elif epoch == 10 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 10
-            v0 = args.gamma * args.G_max * args.FOV * args.dt
-            a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-            args.a_max -= a0 / args.TSP_epoch
-            args.v_max -= v0 / args.TSP_epoch
-        elif epoch == 15 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 10
-            v0 = args.gamma * args.G_max * args.FOV * args.dt
-            a0 = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-            args.a_max -= a0 / args.TSP_epoch
-            args.v_max -= v0 / args.TSP_epoch
-        elif epoch == 20 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 10
-            args.vel_weight *= 10
-            args.acc_weight *= 10
-        elif epoch == 23 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 5
-            args.vel_weight *= 10
-            args.acc_weight *= 10
-        elif epoch == 25 + args.TSP_epoch:
-            model.module.subsampling.interp_gap = 1
-            args.vel_weight *= 10
-            args.acc_weight *= 10
-    else:
+    if args.inter_gap_mode == "changing_downwards":
         if epoch < 10:
             model.module.subsampling.interp_gap = 50
         elif epoch == 10:
@@ -274,6 +199,24 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         elif epoch == 25:
             model.module.subsampling.interp_gap = 1
 
+    if args.inter_gap_mode == "changing_upwards":
+        if epoch < 10:
+            model.module.subsampling.interp_gap = 1
+        elif epoch == 10:
+            model.module.subsampling.interp_gap = 5
+        elif epoch == 15:
+            model.module.subsampling.interp_gap = 10
+        elif epoch == 20:
+            model.module.subsampling.interp_gap = 20
+        elif epoch == 23:
+            model.module.subsampling.interp_gap = 30
+        elif epoch == 25:
+            model.module.subsampling.interp_gap = 50
+
+    print("\n", "epochs: ", epoch ," model.module.subsampling.interp_gap: ", model.module.subsampling.interp_gap)
+
+    psnr_l = []
+    ssim_l = []
     start_epoch = start_iter = time.perf_counter()
     print(f'a_max={args.a_max}, v_max={args.v_max}')
 
@@ -291,8 +234,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         v, a = get_vel_acc(x)
         acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
         vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max).abs() + 1e-8, 2)))
+        resolution = target.shape[-1]
 
-        #print(optimizer)
         if epoch <= 10:
             vel_weight = 1e-3
         elif epoch <= 20:
@@ -300,50 +243,36 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         elif epoch <= 30:
             vel_weight = 1e-1
 
-        # recons = output.to('cpu').squeeze(1).view(target.shape)
-        # recons = transforms.complex_abs(recons)  # complex to real
-        #r econs = recons.squeeze()
-        #l1_loss = F.l1_loss(output, target)
-        tmp = 320
-        #print("output: ", target.unsqueeze(0).shape)
-        #target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (tmp, tmp))
-        #save_image(subsampled.view(-1, 320, 320), f"Images_{args.model}/{args.test_name}/{epoch}", f"{iter}_coil_images")
+        if epoch <= 10:
+            acc_weight = 1e-3
+        elif epoch <= 20:
+            acc_weight = 1e-2
+        elif epoch <= 30:
+            acc_weight = 1e-1
 
-        #save_image(torch.stack((output.view(-1, tmp, tmp),
-        #                            target.view(-1, tmp, tmp)))
-        #                            .view(-1,tmp, tmp),
-        #               f"../../Images_{args.model}/{args.test_name}/{epoch}", f"{iter}")
+        if iter % 100:
+            save_dir = f"Images_{args.model}/{args.test_name}/{epoch}"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = f"{save_dir}/{iter}.png"
+            save_image(torch.stack([output[0].view(resolution, resolution),
+                                    target[0].view(resolution, resolution)]), save_path, f"{iter}")
 
         data_min = target.min()
         data_max = target.max()
         target_normalized = (target - data_min) / (data_max - data_min)
         output_normalized = (output - data_min) / (data_max - data_min)
 
-        #mse_loss = F.mse_loss(output, target)
-        # print(target.shape, recons.shape)
-        # psnr_loss = -psnr(target.to('cpu').detach().numpy(), recons.detach().numpy())
-        #print(target.shape, output.shape)
-        # recons = output.to('cpu').squeeze(1).view(target.shape)
-        # recons = transforms.complex_abs(recons)  # complex to real
-        # recon = recons.squeeze()
-        # print(output.shape, target.shape)
         loss_l1 = F.l1_loss(output, target)
-        # mse_loss = F.mse_loss(output, target)
-        # recons = recons.view(target.shape)
-        # ssim_loss = 1 - ssim(target.numpy(), output.numpy())
-        #print("output: ", output_normalized.min(), output_normalized.max())
-        #print("target: ", target_normalized.min(), target_normalized.max())
-        #ssim_loss_fastmri = SSIMLoss().to(args.device)(output_normalized.unsqueeze(0).unsqueeze(0), target_normalized.unsqueeze(0), result)
-        # print("recon: ", recons, "target: ", target, "\n\n")
-        #SSIM = ssim(target.reshape(-1,320,320).to('cpu').detach().numpy(), output.reshape(-1,320,320).to('cpu').detach().numpy())
-
-        #print(SSIM,ssim_loss_fastmri, 1 - SSIMLoss().to(args.device)(output.unsqueeze(0).unsqueeze(0), target.unsqueeze(0), target.max().reshape(-1,1,1,1)))
+        psnr_l.append(psnr(target.detach().cpu().numpy(), output.detach().cpu().numpy()))
+        ssim_l.append(ssim(target.detach().cpu().numpy(), output.detach().cpu().numpy()))
         rec_loss = loss_l1 #+ dcLoss # SSIMLoss().to(args.device)(output, target, data_range) # F.l1_loss(output, target)
-        #d_N = compute_dc_factors(input, model.get_trajectory().reshape(-1, 2), num_iterations=10)
         if args.TSP and epoch < args.TSP_epoch:
             loss = args.rec_weight * rec_loss
         else:
             loss = args.rec_weight * rec_loss + args.vel_weight * vel_loss + args.acc_weight * acc_loss
+
+        #if vel_loss + acc_loss > 1e-3:
+        #    optimize_trajectory(args, model)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
@@ -358,7 +287,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
                 f'Iter = [{iter:4d}/{len(data_loader):4d}] '
                 f'Loss = {loss.item():.4g} Avg Loss = {avg_loss:.4g} '
                 f'rec_loss: {rec_loss:.4g}, vel_loss: {vel_loss:.4g}, acc_loss: {acc_loss:.4g}'
-
+                f'PSNR: {np.mean(psnr_l):.2f} +- {np.std(psnr_l):.2f}, SSIM: {np.mean(ssim_l):.4f} +- {np.std(ssim_l):.4f}'
             )
         start_iter = time.perf_counter()
     if scheduler:
@@ -378,19 +307,19 @@ def evaluate(args, epoch, model, data_loader, writer):
             for iter, data in enumerate(data_loader):
                 input, target, mean, std, norm = data
                 input = input.to(args.device)
+                resolution = target.shape[-1]
                 target = target.to(args.device)
-                tmp = 320
-                target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (tmp, tmp))
+                target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (resolution, resolution))
 
                 output = model(input.unsqueeze(1))
                 recons = output.to('cpu').squeeze(1).view(target.shape)
-                # recons = transforms.complex_abs(recons)  # complex to real
                 recons = recons.squeeze()
-                loss = F.l1_loss(output.squeeze(), target)
+                if output.shape != target.shape:
+                    target = target.view_as(output)
+                loss = F.l1_loss(output, target)
                 losses.append(loss.item())
-                target = target.view(-1,tmp,tmp)
+                target = target.view(-1,resolution,resolution)
                 recons = recons.view(target.shape)
-                #print(target.shape, recons.shape)
 
                 psnr_l.append(psnr(target.to('cpu').numpy(), recons.numpy()))
                 ssim_l.append(ssim(target.to('cpu').numpy(), recons.numpy()))
@@ -409,11 +338,22 @@ def evaluate(args, epoch, model, data_loader, writer):
         writer.add_scalar('Total_Loss',
                           rec_loss + acc_loss.detach().cpu().numpy() + vel_loss.detach().cpu().numpy(), epoch)
 
+        psnr_mean, psnr_std = np.mean(psnr_l), np.std(psnr_l)
+        ssim_mean, ssim_std = np.mean(ssim_l), np.std(ssim_l)
         x = model.module.get_trajectory()
         v, a = get_vel_acc(x)
         if args.TSP and epoch < args.TSP_epoch:
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
         else:
+            trajectory = plot_trajectory(x.detach().cpu().numpy())
+            ax = trajectory.gca()  # Get the current axis from the figure
+            text_str = f'PSNR: {psnr_mean:.2f} ± {psnr_std:.2f}\nSSIM: {ssim_mean:.4f} ± {ssim_std:.4f}'
+            ax.text(0.05, 0.95, text_str, transform=ax.transAxes, fontsize=12,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            save_dir = f"trajectory/{args.exp_dir}_{args.model}/{args.interp_gap}"
+            os.makedirs(save_dir, exist_ok=True)
+            trajectory.savefig(f"{save_dir}/trajectory_epoch_{epoch}.png")
+            plt.close(trajectory)
             writer.add_figure('Trajectory', plot_trajectory(x.detach().cpu().numpy()), epoch)
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
         writer.add_figure('Accelerations_plot', plot_acc(a.cpu().numpy(), args.a_max), epoch)
@@ -422,7 +362,7 @@ def evaluate(args, epoch, model, data_loader, writer):
     if epoch == 0:
         return None, time.perf_counter() - start
     else:
-        return np.mean(losses), time.perf_counter() - start
+        return np.mean(losses), time.perf_counter() - start, psnr_mean, ssim_mean
 
 
 def plot_scatter(x):
@@ -476,22 +416,12 @@ def visualize(args, epoch, model, data_loader, writer):
             if epoch != 0:
                 print(input.unsqueeze(1).shape)
                 output = model(input.unsqueeze(1))
-                # output = transforms.complex_abs(output)  # complex to real
-                # output = transforms.root_sum_of_squares(output, dim=1).unsqueeze(1)
-
-                # corrupted = model.module.subsampling(input)
-                # corrupted = corrupted[..., 0]  # complex to real
-                # cor_all = transforms.root_sum_of_squares(corrupted, dim=1).unsqueeze(1)
-
                 save_image(output, 'Reconstruction')
-                # save_image(corrupted[:, 0:1, :, :], 'Corrupted0')
-                # save_image(corrupted[:, 1:2, :, :], 'Corrupted1')
-                # save_image(cor_all, 'Corrupted')
                 save_image(torch.abs(target - output), 'Error')
             break
 
 
-def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best):
+def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best):
     torch.save(
         {
             'epoch': epoch,
@@ -499,6 +429,8 @@ def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, is_new_bes
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'best_dev_loss': best_dev_loss,
+            'best_psnr_mean': best_psnr_mean,
+            'best_ssim_mean': best_ssim_mean,
             'exp_dir': exp_dir
         },
         f=exp_dir + '/model.pt'
@@ -508,9 +440,14 @@ def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, is_new_bes
 
 
 def build_model(args):
+    if args.end_epsilon != None and args.epsilon != None:
+        epsilon_step = (args.end_epsilon - args.epsilon)/args.num_epochs
+    else:
+        epsilon_step = 0
+
     model = Subsampling_Model(
-        in_chans=1,
-        out_chans=1,
+        in_chans=args.in_chans,
+        out_chans=args.out_chans,
         chans=args.num_chans,
         num_pool_layers=args.num_pools,
         drop_prob=args.drop_prob,
@@ -521,7 +458,17 @@ def build_model(args):
         SNR=args.SNR,
         n_shots=args.n_shots,
         interp_gap=args.interp_gap,
-        model=args.model
+        type=args.model,
+        img_size=args.img_size,
+        window_size=args.window_size,
+        embed_dim=args.embed_dim,
+        num_blocks=args.num_blocks,
+        sample_per_shot=args.sample_per_shot,
+        noise_mode = args.noise_mode,
+        epsilon = args.epsilon,
+        epsilon_step = epsilon_step,
+        noise_type = args.noise_type,
+        noise_p = args.noise_p
     ).to(args.device)
     return model
 
@@ -536,7 +483,7 @@ def load_model(checkpoint_file):
 
     optimizer = build_optim(args, model)
     optimizer.load_state_dict(checkpoint['optimizer'])
-    return checkpoint, model, optimizer
+    return checkpoint, model, optimizer, args
 
 
 def build_optim(args, model):
@@ -574,13 +521,15 @@ def train():
     args = create_arg_parser().parse_args()
 
     args.v_max = args.gamma * args.G_max * args.FOV * args.dt
-    args.a_max = args.gamma * args.S_max * args.FOV * args.dt ** 2 * 1e3
-    # print(args.v_max)
-    # print(args.a_max)
     args.exp_dir = f'summary/{args.test_name}'
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     pathlib.Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=args.exp_dir)
     with open(args.exp_dir + '/args.txt', "w") as text_file:
@@ -592,6 +541,8 @@ def train():
         checkpoint, model, optimizer = load_model(args.checkpoint)
         # args = checkpoint['args']
         best_dev_loss = checkpoint['best_dev_loss']
+        best_psnr_mean = checkpoint['best_psnr_mean']
+        best_ssim_mean = checkpoint['best_ssim_mean']
         start_epoch = checkpoint['epoch'] + 1
         del checkpoint
     else:
@@ -600,46 +551,39 @@ def train():
             model = torch.nn.DataParallel(model)
         optimizer = build_optim(args, model)
         best_dev_loss = 1e9
+        best_psnr_mean = 0
+        best_ssim_mean = 0
         start_epoch = 0
-
-    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer_rec, max_lr=args.lr,
-    #                                          total_steps=num_epochs, pct_start=0.1,
-    #                                          anneal_strategy='linear',
-    #                                          cycle_momentum=False,
-    #                                          base_momentum=0., max_momentum=0., div_factor=0.1 * num_epochs,
-    #                                          final_div_factor=9)
-
+    inter_gap_mode = args.inter_gap_mode
+    noise_behaviour = args.noise_behaviour
     logging.info(args)
-    # logging.info(model)
 
     train_loader, dev_loader, display_loader = create_data_loaders(args)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
-    #visualize(args, 0, model, display_loader, writer)
     print("started mid point", flush=True)
     for epoch in range(start_epoch, args.num_epochs):
-        print("epoch: ", epoch, "started", flush=True)
-        # scheduler.step(epoch)
-        # if epoch>=args.TSP_epoch:
-        #     optimizer.param_groups[0]['lr']=0.001
-        #     optimizer.param_groups[1]['lr'] = 0.001
+        if noise_behaviour == "log":
+            model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
+        print("epoch: ", epoch, "current noise level: ", model.module.subsampling.epsilon, "started", flush=True)
         train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, None)
-        dev_loss, dev_time = evaluate(args, epoch + 1, model, dev_loader, writer)
-        #visualize(args, epoch + 1, model, display_loader, writer)
+        dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer)
 
-        if epoch == args.TSP_epoch:
-            best_dev_loss = 1e9
-        if dev_loss < best_dev_loss:
+        if psnr_mean > best_psnr_mean:
             is_new_best = True
-            best_dev_loss = dev_loss
+            best_psnr_mean = psnr_mean
+            best_ssim_mean = ssim_mean
             best_epoch = epoch + 1
         else:
             is_new_best = False
-        save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best)
+        save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best)
         logging.info(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
         )
+
+        if noise_behaviour == "linear":
+            model.module.increase_noise_linearly()
+
     print(args.test_name)
     eval(args, model, dev_loader)
     print(f'Training done, best epoch: {best_epoch}')
@@ -708,6 +652,23 @@ def create_arg_parser():
                         help='number of interpolated points between 2 parameter points in the trajectory')
     parser.add_argument('--model', type=str, default='Unet',
                         help='the model type and params of the reconstruction net')
+    parser.add_argument('--inter-gap-mode', type=str, default='constant',
+                        help='How the interpolated gap will change during the training')
+    parser.add_argument('--img-size', type=int, nargs=2, default=[320, 320], help='Image size (height, width)')
+    parser.add_argument('--in-chans', type=int, default=1, help='Number of input channels')
+    parser.add_argument('--out-chans', type=int, default=1, help='Number of output channels')
+    parser.add_argument('--num-blocks', type=int, default=1, help='Number of blocks in the model')
+    parser.add_argument('--window-size', type=int, default=10, help='Window size for the model')
+    parser.add_argument('--embed-dim', type=int, default=66, help='Embedding dimension for the model')
+    parser.add_argument('--sample-per-shot', type=int, default=3001, help='Number of samples per shot')
+    parser.add_argument('--noise-mode', type=str, default='ones',
+                        help='Type of noise to be added (e.g., "ones" or "random")')
+    parser.add_argument('--noise-behaviour', type=str, default='constant',
+                        help='How the noise should behave (e.g., "constant" or "linear")')
+    parser.add_argument('--epsilon', type=float, default=0, help='Starting value of epsilon for noise scaling')
+    parser.add_argument('--end-epsilon', type=float, default=1e7, help='End value of epsilon for noise scaling')
+    parser.add_argument('--noise-type', type=str, default='l1', help='Type of noise to be added (e.g., "l1", "l2")')
+    parser.add_argument('--noise-p', type=float, default='0', help='Probability of applying noise during training')
     return parser
 
 
