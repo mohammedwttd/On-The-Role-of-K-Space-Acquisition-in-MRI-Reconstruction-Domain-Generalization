@@ -181,6 +181,52 @@ def optimize_trajectory(args, model):
 
     print("Training completed!, took it from: ", init_loss," to: ", acc_loss + vel_loss)
 
+def pgd_attack_with_trajectory(model, input_tensor, target_tensor, epsilon, steps=10):
+    initial_trajectory = model.module.subsampling.x.detach().clone()
+    trajectory_param = model.module.subsampling.x
+    trajectory_param.requires_grad = True
+
+    output = model(input_tensor.unsqueeze(1))
+    if output.shape != target_tensor.shape:
+        target_tensor = target_tensor.view_as(output)
+
+    init_psnr = psnr(target_tensor.to('cpu').numpy(), output.cpu().detach().numpy())
+    lowest_psnr = float('inf')
+    best_trajectory = initial_trajectory.clone().data.detach()
+
+    for _ in range(steps):
+        if model.module.subsampling.x.grad != None:
+            model.module.subsampling.x.grad.zero_()
+
+        output = model(input_tensor.unsqueeze(1))
+        if output.shape != target_tensor.shape:
+            target_tensor = target_tensor.view_as(output)
+
+        loss = F.l1_loss(output.to("cpu"), target_tensor.to("cpu"))
+        psnr_value = psnr(target_tensor.to('cpu').numpy(), output.cpu().detach().numpy())
+
+        if psnr_value < lowest_psnr:
+            lowest_psnr = psnr_value
+            best_trajectory = model.module.subsampling.x.data.clone().detach()
+
+        grad = torch.autograd.grad(loss, model.module.subsampling.x, retain_graph=True)[0]
+
+        trajectory = model.module.subsampling.x.data + grad.sign()
+
+        eta = torch.clamp(trajectory - initial_trajectory, min=-epsilon, max=epsilon)
+
+        trajectory = initial_trajectory + eta
+
+        trajectory = torch.clamp(trajectory, min=-160, max=160)
+
+        model.module.subsampling.x.data = trajectory
+
+        del loss, output  # Delete unnecessary tensors after use
+        torch.cuda.empty_cache()
+
+    model.module.subsampling.x = torch.nn.Parameter(initial_trajectory, requires_grad=True)  # Restore original
+    return best_trajectory - initial_trajectory
+
 def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
     avg_loss = 0.
@@ -228,8 +274,11 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         input = input.to(args.device)
         target = target.to(args.device)
 
-        output = model(input.unsqueeze(1))
+        if args.noise_behaviour == "PGD":
+            model.module.subsampling.attack_trajectory = pgd_attack_with_trajectory(model, input, target, model.module.subsampling.epsilon, args.noise_steps)
+            optimizer = build_optim(args, model)
 
+        output = model(input.unsqueeze(1))
         x = model.module.get_trajectory()
         v, a = get_vel_acc(x)
         acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
@@ -274,9 +323,12 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         #if vel_loss + acc_loss > 1e-3:
         #    optimize_trajectory(args, model)
 
+        #print("before backprop:", model.module.subsampling.x)
         loss.backward()
+        #print("after backprop:", model.module.subsampling.x)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
         optimizer.step()
+
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
         # writer.add_scalar('TrainLoss', loss.item(), global_step + iter)
@@ -668,7 +720,8 @@ def create_arg_parser():
     parser.add_argument('--epsilon', type=float, default=0, help='Starting value of epsilon for noise scaling')
     parser.add_argument('--end-epsilon', type=float, default=1e7, help='End value of epsilon for noise scaling')
     parser.add_argument('--noise-type', type=str, default='l1', help='Type of noise to be added (e.g., "l1", "l2")')
-    parser.add_argument('--noise-p', type=float, default='0', help='Probability of applying noise during training')
+    parser.add_argument('--noise-p', type=float, default=0, help='Probability of applying noise during training')
+    parser.add_argument('--noise-steps', type=int, default=0, help='The number of PGD steps to apply noise during training')
     return parser
 
 

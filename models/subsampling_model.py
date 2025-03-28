@@ -84,11 +84,12 @@ class Subsampling_Layer(nn.Module):
         else:
             print('Wrong initialization')
         self.x = torch.nn.Parameter(x, requires_grad=bool(int(trajectory_learning)))
+        self.trajectory_learning = bool(int(trajectory_learning))
         return
 
     def __init__(self, decimation_rate, res, trajectory_learning, initialization, n_shots, interp_gap, SNR=False,
                  projection_iters=10, sample_per_shot = 3001, interp_gap_mode = 0, epsilon = 0, epsilon_step = None,
-                 noise_type = None, noise_mode = None, noise_p = 0):
+                 noise_type = None, noise_mode = None, noise_p = 0, model = None):
         super().__init__()
 
         random.seed(42)
@@ -105,6 +106,8 @@ class Subsampling_Layer(nn.Module):
         self.noise_type = noise_type
         self.noise_mode = noise_mode
         self.noise_p = noise_p
+        self.model = None
+        self.attack_trajectory = None
         print(noise_p)
 
     def increase_noise_linearly(self):
@@ -119,6 +122,7 @@ class Subsampling_Layer(nn.Module):
         self.epsilon += self.epsilon_step
         return self.epsilon
 
+
     def add_normed_noise(self, x_full):
         """
         Adds noise to x_full with a fixed magnitude epsilon, either in L1 or L2 norm.
@@ -130,13 +134,19 @@ class Subsampling_Layer(nn.Module):
         """
         if self.noise_p >= 0 and (not self.training or self.epsilon == 0 or random.random() <= (1 - self.noise_p)):
             return x_full
+
+        if self.attack_trajectory != None:
+            return  torch.clamp(self.attack_trajectory.reshape(-1, 2) + x_full, min=-160, max=160)
+
         noise = torch.randn_like(x_full) if self.noise_mode == "random" else torch.ones_like(x_full)
         if self.noise_type == "l1":
             norm = torch.norm(noise, p=1, dim=-1, keepdim=True)
         elif self.noise_type == "l2":
             norm = torch.norm(noise, p=2, dim=-1, keepdim=True)
+        elif self.noise_type == "linf":
+            norm = torch.norm(noise, p=float('inf'), dim=-1, keepdim=True)
         else:
-            raise ValueError("noise_type must be 'l1' or 'l2'")
+            raise ValueError("noise_type must be 'l1'/'l2'/Linf")
 
         if self.noise_p != -1:
             scaled_noise = self.epsilon * noise / (norm + 1e-8)
@@ -148,6 +158,7 @@ class Subsampling_Layer(nn.Module):
         return noisy_x
 
     def forward(self, input):
+        self.x.requires_grad_(self.trajectory_learning)
         if self.interp_gap > 1:
             t = torch.arange(0, self.x.shape[1], device=self.x.device).float()
             t1 = t[::self.interp_gap]
@@ -157,6 +168,7 @@ class Subsampling_Layer(nn.Module):
                     self.x.data[shot, :, d] = self.interp(t1, x_short[shot, :, d], t)
 
         x_full = self.add_normed_noise(self.x.reshape(-1,2))
+
         input = input.permute(0, 1, 4, 2, 3)
         sub_ksp = nufft(input, x_full)
         if self.SNR:

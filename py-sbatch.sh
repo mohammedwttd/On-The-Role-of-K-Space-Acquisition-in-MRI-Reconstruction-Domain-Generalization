@@ -28,10 +28,10 @@
 NUM_NODES=1
 NUM_CORES=2
 NUM_GPUS=1
-GPU="ran-mashawsha"
+AVAILABLE_GPUS="newton1" # List of allowed nodes
 JOB_NAME="PILOT"
 MAIL_USER="mohammed-wa@campus.technion.ac.il"
-MAIL_TYPE=All # Valid values are NONE, BEGIN, END, FAIL, REQUEUE, ALL
+MAIL_TYPE=ALL # Valid values are NONE, BEGIN, END, FAIL, REQUEUE, ALL
 ###
 # Conda parameters
 #
@@ -39,14 +39,14 @@ CONDA_HOME=$HOME/miniconda3
 CONDA_ENV=mpilot
 
 sbatch \
-	-N $NUM_NODES \
-	-c $NUM_CORES \
-	-w $GPU \
-	--gres=gpu:$NUM_GPUS \
-	--job-name $JOB_NAME \
-	--mail-user $MAIL_USER \
-	--mail-type $MAIL_TYPE \
-	-o 'slurm-%N-%j.out' \
+    -N $NUM_NODES \
+    -c $NUM_CORES \
+    -w $AVAILABLE_GPUS \
+    --gres=gpu:$NUM_GPUS \
+    --job-name $JOB_NAME \
+    --mail-user $MAIL_USER \
+    --mail-type $MAIL_TYPE \
+    -o "slurm-%N-%j.out" \
 <<EOF
 #!/bin/bash
 echo "*** SLURM BATCH JOB '$JOB_NAME' STARTING ***"
@@ -57,8 +57,7 @@ source $CONDA_HOME/etc/profile.d/conda.sh
 conda activate $CONDA_ENV
 
 # Run python with the args to the script
-python $@
+python "$@"
 
 echo "*** SLURM BATCH JOB '$JOB_NAME' DONE ***"
 EOF
-

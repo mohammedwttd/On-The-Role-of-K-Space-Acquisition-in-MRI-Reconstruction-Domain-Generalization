@@ -9,7 +9,7 @@ sub_lr = 0.075
 rec_lr = 1e-4 * 5
 acc_weight = 0.001
 vel_weight = 0.001
-batch_size = 25
+batch_size = 10
 init = 'radial'
 n_shots = 16
 trajectory_learning = 1
@@ -37,12 +37,12 @@ embed_dim = 66
 
 #noise
 noise_mode = "random"
-noise_behaviour = "constant"
-epsilon = 1e5
+noise_behaviour = "PGD"
+epsilon = 3
 end_epsilon = 1e8
-noise_type = "l1"
-noise_epoch = 20
-noise_p = 1             #-1 for having p * epsilon
+noise_type = "linf"
+noise_steps = 2
+noise_p = 0.5             #-1 for having p * epsilon
 
 if trajectory_learning == 1:
     test_name = f'{n_shots}/{init}_{rec_lr}_{sub_lr}_{acc_weight}_{vel_weight}_{inter_gap_mode}_{interp_gap}_{model}'
@@ -65,6 +65,10 @@ if epsilon != 0:
 
     if noise_behaviour == "log":
         test_name += "_log_noise"
+
+    if noise_behaviour == "PGD":
+        test_name += "_PGD_noise"
+        test_name += f"_steps{noise_steps}"
 
     test_name += f'_start_epsilon{epsilon}'
 
@@ -109,7 +113,8 @@ command = f'python3 train.py --test-name={test_name} ' \
           f'--epsilon={epsilon} ' \
           f'--end-epsilon={end_epsilon} ' \
           f'--noise-type={noise_type} '  \
-          f'--noise-p={noise_p}'
+          f'--noise-p={noise_p} '  \
+          f'--noise-steps={noise_steps}'
 
 print(command)
 os.system(command)
