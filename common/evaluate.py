@@ -10,7 +10,8 @@ from argparse import ArgumentParser
 import h5py
 import numpy as np
 from runstats import Statistics
-from skimage.measure import compare_psnr, compare_ssim
+from skimage.metrics import peak_signal_noise_ratio as sk_psnr
+from skimage.metrics import structural_similarity as sk_ssim
 import sys
 sys.path.insert(0,'/home/tomerweiss/multiPILOT2')
 
@@ -24,7 +25,7 @@ def nmse(gt, pred):
 
 def psnr(gt, pred):
     """ Compute Peak Signal to Noise Ratio metric (PSNR) """
-    return compare_psnr(gt, pred, data_range=gt.max())
+    return sk_psnr(gt, pred, data_range=gt.max() - gt.min())
 
 def psnr1(gt, pred):
     """ Compute Peak Signal to Noise Ratio metric (PSNR) """
@@ -39,9 +40,14 @@ def psnr1(gt, pred):
 
 def ssim(gt, pred):
     """ Compute Structural Similarity Index Metric (SSIM). """
-    return compare_ssim(
-        gt.transpose(1, 2, 0), pred.transpose(1, 2, 0), multichannel=True, data_range=gt.max()
+    
+    ssim_value = sk_ssim(
+        gt.transpose(1, 2, 0),  # Convert to (H, W, C)
+        pred.transpose(1, 2, 0),
+        data_range=gt.max() - gt.min(),  # Explicit range for float images
+        channel_axis=2
     )
+    return ssim_value
 
 def ssim1(gt, pred):
     """ Compute Structural Similarity Index Metric (SSIM). """

@@ -37,12 +37,17 @@ class SliceData(Dataset):
             try:
                 with h5py.File(fname, 'r') as data:
 
-                    if data.attrs['acquisition'] == 'AXT2':   # should be 'CORPD_FBK' or 'CORPDFS_FBK'
+                    if data.attrs['acquisition'] != None:   # should be 'CORPD_FBK' or 'CORPDFS_FBK'
 
                         kspace = data['kspace']
-                        if kspace.shape[-2] < resolution[0] or kspace.shape[-1] < resolution[1]:
+                        target = data['reconstruction_rss']
+                        if kspace.shape[-2] < 320 or kspace.shape[-1] < 320:
                             continue
-                        num_slices = kspace.shape[0]
+
+                        if target.shape[-2] < 320 or target.shape[-1] < 320:
+                            continue
+
+                        num_slices = kspace.shape[0]                        
                         self.examples += [(fname, slice) for slice in range(5, num_slices-2)]
             except Exception as e:
                 continue

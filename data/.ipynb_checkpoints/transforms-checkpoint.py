@@ -16,7 +16,9 @@ def to_tensor(data):
 
 def rfft2(data):
     data = ifftshift(data, dim=(-2, -1))
-    data = torch.rfft(data, 2, normalized=False,onesided=False)
+    data = torch.view_as_complex(data)
+    data = torch.fft.rfft2(data,onesided=False)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-3, -2))
     data=data.permute(0,1,4,2,3)
     data=data.squeeze(1)
@@ -25,7 +27,9 @@ def rfft2(data):
     
 def rfft2_regular(data):
     data = ifftshift(data, dim=(-2, -1))
-    data = torch.rfft(data, 2, normalized=True,onesided=False)
+    data = torch.view_as_complex(data)
+    data = torch.fft.rfft2(data,onesided=False)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-3, -2))
     return data
 
@@ -35,21 +39,27 @@ def irfft2(data):
     # data=data.reshape(1,1,320,320,2)
     assert data.size(-1) == 2
     data = ifftshift(data, dim=(-3, -2))
-    data = torch.irfft(data, 2, normalized=False,onesided=False)
+    data = torch.view_as_complex(data)
+    data = torch.fft.irfft2(data,onesided=False)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-2, -1))
     return data
 
 def irfft2_regular(data):
     assert data.size(-1) == 2
     data = ifftshift(data, dim=(-3, -2))
-    data = torch.irfft(data, 2, normalized=False,onesided=False)
+    data = torch.view_as_complex(data)
+    data = torch.fft.irfft2(data,onesided=False)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-2, -1))
     return data
 
 def fft2(data):
     assert data.size(-1) == 2
     data = ifftshift(data, dim=(-3, -2))
-    data = torch.fft(data, 2, normalized=True)
+    data = torch.view_as_complex(data)
+    data = torch.fft.fft2(data)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-3, -2))
     return data
 
@@ -58,16 +68,23 @@ def ifft2(data):
     data = data.permute(0, 1, 3, 4, 2)
     assert data.size(-1) == 2
     data = ifftshift(data, dim=(-3, -2))
-    data = torch.ifft(data, 2, normalized=False)
+    data = torch.view_as_complex(data)
+    data = torch.fft.ifft2(data)
+    data = torch.view_as_real(data)
     data = fftshift(data, dim=(-3, -2))
     data = data.permute(0, 1, 4, 2, 3)
     data = data.squeeze(1)
     return data
-
+    
+    
 def ifft2_regular(data):
     assert data.size(-1) == 2
+    # Convert from two channels to complex
     data = ifftshift(data, dim=(-3, -2))
-    data = torch.ifft(data, 2, normalized=True)
+    data = torch.view_as_complex(data)
+    data = torch.fft.ifft2(data, norm="ortho")  # or norm=None
+    data = torch.view_as_real(data)
+    #data = torch.fft.ifft2(data)
     data = fftshift(data, dim=(-3, -2))
 
     return data
@@ -116,6 +133,8 @@ def center_crop(data, shape):
     """
     if 0 >= shape[1] or shape[1] > data.shape[-1]:
         print(shape[0], shape[1], data.shape[-1], data.shape[-2], flush=True)
+    if not  0 < shape[0] <= data.shape[-2]:
+        print(data.shape)
     assert 0 < shape[0] <= data.shape[-2]
     assert 0 < shape[1] <= data.shape[-1]
     w_from = (data.shape[-2] - shape[0]) // 2

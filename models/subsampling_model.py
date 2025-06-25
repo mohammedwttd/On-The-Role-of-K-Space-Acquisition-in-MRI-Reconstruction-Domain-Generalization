@@ -6,7 +6,7 @@ import fastmri.models
 from models.rec_models.unet_model import UnetModel
 from models.rec_models.complex_unet import ComplexUnetModel
 import data.transforms as transforms
-from pytorch_nufft.nufft import nufft, nufft_adjoint
+from pytorch_nufft.nufft2 import nufft, nufft_adjoint
 import numpy as np
 from WaveformProjection.run_projection import proj_handler
 import matplotlib.pylab as P
@@ -17,7 +17,9 @@ from  models.VarBlock import VarNet
 from typing import Tuple
 from fastmri.data.subsample import create_mask_for_mask_type
 from fastmri.data.transforms import apply_mask
+from models.rec_models.dcg import Generator, Discriminator
 import random
+import fastmri
 
 import os
 import torch
@@ -27,6 +29,8 @@ import torch
 import torchvision
 import matplotlib.pyplot as plt
 
+def normalize(img):
+    return (img - img.min()) / (img.max() - img.min() + 1e-8)
 
 def save_image(source, folder_path, image_name):
     source = source.clone()
@@ -49,8 +53,99 @@ def save_image(source, folder_path, image_name):
     save_path = os.path.join(folder_path, f'{image_name}.png')
     plt.imsave(save_path, numpy_image)
 
-class Subsampling_Layer(nn.Module):
+class SubsamplingBinary(nn.Module):
+    def initialize_random_mask(self, num_cols, acceleration, center_fraction):
+        rng = np.random.RandomState()
+        num_low_freqs = int(round(num_cols * center_fraction))
+        num_high_freq = int(num_cols / acceleration) - num_low_freqs
+        high_freq_mask = rng.uniform(size=(num_cols - num_low_freqs))
+        sorted_vals = np.sort(high_freq_mask)
+        threshold = sorted_vals[-num_high_freq]
+        high_freq_mask[high_freq_mask >= threshold] = 1
+        high_freq_mask[high_freq_mask < threshold] = 0
+        pad = (num_cols - num_low_freqs + 1) // 2
+        low_freq_mask = np.ones(num_low_freqs)
+        mask = np.concatenate((high_freq_mask[:pad], low_freq_mask, high_freq_mask[pad:]))
+        mask = mask * 0.5 + 0.5 * rng.uniform(size=num_cols)
+        return torch.tensor(mask, dtype=torch.float)
 
+    def __init__(self, res, acceleration=4, center_fraction=0.08, momentum=0.9, use_random=False, trajectory_learning = True):
+        super().__init__()
+        self.res = res
+        self.acceleration = acceleration
+        self.center_fraction = center_fraction
+        self.momentum = momentum
+        self.use_random = use_random
+        # Initialize velocity as a tensor with the same shape as mask
+        mask = self.initialize_random_mask(res, self.acceleration, self.center_fraction)
+        self.velocity = torch.zeros_like(mask)
+        self.mask = torch.nn.Parameter(mask, requires_grad=False)
+        mask_shape = [1, 1, res, 1, 1]
+        Bimask_1 = torch.tensor(mask)
+        self.Bimask = torch.nn.Parameter(torch.reshape(Bimask_1, mask_shape), requires_grad=bool(int(trajectory_learning)))
+        self.trajectory_learning = bool(int(trajectory_learning))
+
+    def get_mask(self):
+        res = self.res
+        sorted_parameters, _ = torch.sort(self.mask)
+        threshold = sorted_parameters[res - int(res / self.acceleration)]
+        return self.mask >= threshold
+
+    def make_mask(self, shape):
+        res = shape[2]
+        if self.use_random:
+            with torch.no_grad():
+                self.mask.data = self.initialize_random_mask(res, self.acceleration, self.center_fraction).to('cuda')
+
+        sorted_parameters, _ = torch.sort(self.mask)
+        threshold = sorted_parameters[res - int(res / self.acceleration)]
+        with torch.no_grad():
+            # Create a new tensor instead of in-place update
+            new_bimask = torch.zeros_like(self.Bimask)
+            new_bimask[0, 0, :, 0, 0] = (self.mask >= threshold).float()
+            self.Bimask.data = new_bimask  # Update data safely
+        return
+
+    def transform(self, input):
+        input = fastmri.ifft2c(input)
+        input = transforms.complex_abs(input)
+        input = normalize(input)
+        return input
+
+    def forward(self, input):
+        # input: [B, 1, H, W, 2] (complex image domain)
+        self.make_mask(input.shape)
+        input_c = fastmri.fft2c(input).clone()  # Clone to avoid view issues
+        if input_c.device != self.Bimask.device:
+            self.Bimask = self.Bimask.to(input_c.device)
+        input_c_m = input_c * self.Bimask
+        return self.transform(input_c_m)
+
+    def apply_binary_grad(self, lr):
+        if not self.trajectory_learning:
+            return
+        print("got here")
+        self.velocity = self.momentum * self.velocity.to("cuda") + (1 - self.momentum) * self.Bimask.grad[0, 0, :, 0, 0]
+        new_mask = self.mask - lr * self.velocity
+        new_mask = torch.clamp(new_mask, -1, 1)
+        self.mask.data = new_mask
+
+    def get_trajectory(self):
+        def mask_to_trajectory(mask):
+            mask = np.squeeze(self.get_mask())
+            x_values = [x for x in range(-160, 160)]
+
+            trajectory = []
+            for i in range(320):
+                if mask[i].item() == True:
+                    for x in x_values:
+                        trajectory.append([x, i - 160])
+            return torch.tensor(trajectory).reshape(-1, 320, 2)
+
+        return mask_to_trajectory(self.Bimask.data)
+
+
+class Subsampling_Layer(nn.Module):    
     def initilaize_trajectory(self, trajectory_learning, initialization, n_shots):
         # x = torch.zeros(self.num_measurements, 2)
         sample_per_shot = self.sample_per_shot # TODO, try to increase this (instead of #of shots)
@@ -88,8 +183,7 @@ class Subsampling_Layer(nn.Module):
         return
 
     def __init__(self, decimation_rate, res, trajectory_learning, initialization, n_shots, interp_gap, SNR=False,
-                 projection_iters=10, sample_per_shot = 3001, interp_gap_mode = 0, epsilon = 0, epsilon_step = None,
-                 noise_type = None, noise_mode = None, noise_p = 0, model = None):
+                 projection_iters=10, sample_per_shot = 3001, interp_gap_mode = 0, epsilon = 0, epsilon_step = None, noise_p = 0, std = 0):
         super().__init__()
 
         random.seed(42)
@@ -103,11 +197,9 @@ class Subsampling_Layer(nn.Module):
         self.iters = projection_iters
         self.epsilon = epsilon
         self.epsilon_step = epsilon_step
-        self.noise_type = noise_type
-        self.noise_mode = noise_mode
         self.noise_p = noise_p
-        self.model = None
         self.attack_trajectory = None
+        self.std = std
         print(noise_p)
 
     def increase_noise_linearly(self):
@@ -124,38 +216,21 @@ class Subsampling_Layer(nn.Module):
 
 
     def add_normed_noise(self, x_full):
-        """
-        Adds noise to x_full with a fixed magnitude epsilon, either in L1 or L2 norm.
-
-        Args:
-            x_full (torch.Tensor): The input tensor to which noise will be added.
-        Returns:
-            torch.Tensor: The noisy tensor, clamped within [-160, 160].
-        """
-        if self.noise_p >= 0 and (not self.training or self.epsilon == 0 or random.random() <= (1 - self.noise_p)):
+        if self.noise_p >= 0 and (not self.training or random.random() <= (1 - self.noise_p)):
             return x_full
 
-        if self.attack_trajectory != None:
+        if self.epsilon > 0 and self.attack_trajectory != None:
+            print("applied PGD!")
             return  torch.clamp(self.attack_trajectory.reshape(-1, 2) + x_full, min=-160, max=160)
 
-        noise = torch.randn_like(x_full) if self.noise_mode == "random" else torch.ones_like(x_full)
-        if self.noise_type == "l1":
-            norm = torch.norm(noise, p=1, dim=-1, keepdim=True)
-        elif self.noise_type == "l2":
-            norm = torch.norm(noise, p=2, dim=-1, keepdim=True)
-        elif self.noise_type == "linf":
-            norm = torch.norm(noise, p=float('inf'), dim=-1, keepdim=True)
-        else:
-            raise ValueError("noise_type must be 'l1'/'l2'/Linf")
+        elif self.std > 0:
+            print("applied std path!")
+            scaled_noise = torch.randn_like(x_full) * self.std
+            noisy_x = x_full + scaled_noise
+            noisy_x = torch.clamp(noisy_x, min=-160, max=160)
+            return noisy_x
 
-        if self.noise_p != -1:
-            scaled_noise = self.epsilon * noise / (norm + 1e-8)
-        else:
-            scaled_noise = self.epsilon * random.random() * noise / (norm + 1e-8)
-
-        noisy_x = x_full + scaled_noise
-        noisy_x = torch.clamp(noisy_x, min=-160, max=160)
-        return noisy_x
+        return x_full
 
     def forward(self, input):
         self.x.requires_grad_(self.trajectory_learning)
@@ -177,6 +252,8 @@ class Subsampling_Layer(nn.Module):
             sub_ksp = sub_ksp + noise.to(sub_ksp.device)
         output = nufft_adjoint(sub_ksp, x_full, input.shape)
         output = output.permute(0, 1, 3, 4, 2)
+        output = transforms.complex_abs(output)
+        output = normalize(output)
         return output
 
     def get_trajectory(self):
@@ -201,113 +278,76 @@ class Subsampling_Layer(nn.Module):
         m = (y[1:] - y[:-1]) / (x[1:] - x[:-1])
         m = torch.cat([m[[0]], (m[1:] + m[:-1]) / 2, m[[-1]]])
         I = P.searchsorted(x[1:].detach().cpu(), xs.detach().cpu())
+        I = torch.clamp(I, 0, x.shape[0] - 2) 
         dx = (x[I + 1] - x[I])
         hh = self.h_poly((xs - x[I]) / dx)
         return hh[0] * y[I] + hh[1] * m[I] * dx + hh[2] * y[I + 1] + hh[3] * m[I + 1] * dx
 
-    def trajectory_to_mask(
-            self,
-            grid_shape: Tuple[int, int]
-    ) -> torch.Tensor:
-        """
-        Converts a k-space trajectory into a binary mask.
-
-        Args:
-            trajectory (torch.Tensor): A tensor of shape (-1, 2) representing the k-space trajectory.
-                                       Each row contains (kx, ky) coordinates normalized to [-1, 1].
-            grid_shape (Tuple[int, int]): The shape of the mask grid (height, width).
-
-        Returns:
-            torch.Tensor: A binary mask of shape (height, width) with 1s at sampled locations.
-        """
-        H, W = grid_shape  # Unpack grid dimensions
-
-        # Normalize trajectory to grid coordinates
-        trajectory = self.x.reshape(-1,2)
-        print(trajectory)
-        grid_kx = ((trajectory[:, 0] + 1) / 2 * (W - 1)).long()
-        grid_ky = ((trajectory[:, 1] + 1) / 2 * (H - 1)).long()
-
-        # Clip to ensure indices are within bounds
-        grid_kx = grid_kx.clamp(0, W - 1)
-        grid_ky = grid_ky.clamp(0, H - 1)
-
-        # Initialize an empty mask
-        mask = torch.zeros(H, W, dtype=torch.int8)
-
-        # Set sampled locations to 1
-        mask[grid_ky, grid_kx] = 1
-
-        print(mask)
-        return mask
 
     def __repr__(self):
         return f'Subsampling_Layer'
 
-class HUMUSReconstructionModel(nn.Module):
-    def __init__(self, img_size, in_chans, out_chans, num_blocks, window_size, embed_dim):
-        super(HUMUSReconstructionModel, self).__init__()
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            self.blocks.append(
-                HUMUSBlock(
-                    img_size=img_size,
-                    in_chans=in_chans if i == 0 else out_chans,
-                    out_chans=out_chans,
-                    window_size=window_size,
-                    embed_dim=embed_dim
-                )
-            )
-    def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        return x
 
 class Subsampling_Model(nn.Module):
     def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob, decimation_rate, res,
                  trajectory_learning, initialization, n_shots, interp_gap, SNR=False, type=None,
                  img_size=(320, 320) ,window_size=10, embed_dim=66, num_blocks=1, sample_per_shot=3001,
-                 epsilon = 0, epsilon_step = None, noise_type = None, noise_mode = None, noise_p = 0):
+                 epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08):
         super().__init__()
         self.type = type
-        self.subsampling = Subsampling_Layer(decimation_rate, res, trajectory_learning, initialization, n_shots,
-                                             interp_gap, SNR, sample_per_shot = sample_per_shot, epsilon = epsilon,
-                                             epsilon_step = epsilon_step, noise_type = noise_type, noise_mode = noise_mode,
-                                             noise_p = noise_p)
-        if type == 'vit':
-            avrg_img_size = 320
-            patch_size = 10
-            depth = 4
-            num_heads = 9
-            embed_dim = 300
+        if initialization != "cartesian":
+            self.subsampling = Subsampling_Layer(decimation_rate, res, trajectory_learning, initialization, n_shots,
+                                                 interp_gap, SNR, sample_per_shot = sample_per_shot, epsilon = epsilon,
+                                                 epsilon_step = epsilon_step, noise_p = noise_p, std = std)
+        else:
+            self.subsampling = SubsamplingBinary(img_size[0], acceleration, center_fraction, trajectory_learning = trajectory_learning).to("cuda")
+            
+        if 'vit' in type:
+            if "vit-l" in type:
+                avrg_img_size = 340 if "pretrain" in type else 320
+                patch_size = 10
+                depth = 10
+                num_heads = 16
+                embed_dim = 44
+            elif type == "vit-m":
+                avrg_img_size = 320
+                patch_size = 10
+                depth = 8
+                num_heads = 9
+                embed_dim = 64
+            else:
+                avrg_img_size = 320
+                patch_size = 10
+                depth = 4
+                num_heads = 9
+                embed_dim = 44
+
             vitNet = VisionTransformer(
                 avrg_img_size=avrg_img_size,
                 patch_size=patch_size,
                 in_chans=1, embed_dim=embed_dim,
                 depth=depth, num_heads=num_heads,
             )
-            self.reconstruction_model = vitNet
+            self.reconstruction_model = ReconNet(vitNet)
+
         elif type == 'Unet':
             self.reconstruction_model = UnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob)
-        else:
+        elif type == 'humus':
             HUMUSReconstructionNet = HUMUSBlock(img_size=img_size, in_chans =in_chans, out_chans = out_chans, num_blocks = num_blocks, window_size = window_size, embed_dim = embed_dim)
             self.reconstruction_model = HUMUSReconstructionNet
+        elif type == 'DCG':
+            self.reconstruction_model = {"G": Generator().to("cuda"), "D": Discriminator().to("cuda")}
+        
 
         self.iter = 0
 
-
     def forward(self, input):
-        if self.type == "vit":
-            input = self.subsample_and_stack(input).squeeze()
-            kspace = transforms.fft2(input)
-            mask = self.subsampling.trajectory_to_mask((kspace.shape[-3], kspace.shape[-2]))
-            print(mask.shape)
-            num_ones = torch.sum(mask == 1).item()
-            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=0).unsqueeze(0).unsqueeze(0)
-            return self.reconstruction_model(input, None)
+        if "vit" in self.type:
+            input = self.subsampling(input)
+            output = self.reconstruction_model(input).reshape(-1, 320, 320)
+            return output
         elif self.type == 'Unet':
             input = self.subsampling(input)
-            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=1).unsqueeze(1)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
         elif self.type == "humus":
@@ -316,6 +356,11 @@ class Subsampling_Model(nn.Module):
             out = out.permute(0,2,3,1)
             output = transforms.root_sum_of_squares(transforms.complex_abs(out.unsqueeze(0)), dim=1)
             return output.reshape(-1, 320, 320)
+        elif self.type == "DCG":
+            input = self.subsampling(input)
+            input = transforms.root_sum_of_squares(transforms.complex_abs(input), dim=1).unsqueeze(1)
+            output = self.reconstruction_model["G"](input).reshape(-1, 320, 320)
+            return output
         return None
 
     def get_trajectory(self):

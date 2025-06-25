@@ -2,7 +2,7 @@ from pytorch_nufft import util
 import pytorch_nufft.interp as interp
 import numpy
 import torch
-from data import transforms
+from data import transforms2
 
 
 def nufft(input, coord, oversamp=1.25, width=4.0, n=128, device='cuda'):
@@ -114,7 +114,7 @@ def _apodize(input, ndim, oversamp, width, beta, device):
     for a in range(-ndim, 0):
         i = output.shape[a]
         os_i = _get_ugly_number(oversamp * i)
-        idx = torch.arange(i, dtype=output.dtype, device=device)
+        idx = torch.arange(i, dtype=torch.float32, device=device).to(output.dtype)
 
         # Calculate apodization
         apod = (beta ** 2 - (numpy.pi * width * (idx - i // 2) / os_i) ** 2) ** 0.5

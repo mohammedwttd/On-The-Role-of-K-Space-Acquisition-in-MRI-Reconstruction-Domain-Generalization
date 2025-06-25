@@ -72,7 +72,6 @@ def apply_mask(
             mask: The generated mask
     """
     shape = np.array(data.shape)
-    print(shape)
     shape[:-3] = 1
     mask = mask_func(shape, seed)
     if padding is not None:

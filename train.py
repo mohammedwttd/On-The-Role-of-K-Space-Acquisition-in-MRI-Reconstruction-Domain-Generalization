@@ -8,6 +8,7 @@ import os
 import sys
 # sys.path.insert(0, '/home/tomerweiss/multiPILOT2')
 
+import fastmri
 import numpy as np
 # np.seterr('raise')
 import torch
@@ -20,11 +21,14 @@ from data import transforms
 from data.mri_data import SliceData
 import matplotlib
 
+from models.rec_models.recon_net import ReconNet
+from models.rec_models.vit_model import VisionTransformer
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from models.subsampling_model import Subsampling_Model
 from scipy.spatial import distance_matrix
-from tsp_solver.greedy import solve_tsp
+#from tsp_solver.greedy import solve_tsp
 import scipy.io as sio
 from common.utils import get_vel_acc
 from common.evaluate import psnr, ssim
@@ -33,8 +37,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 import matplotlib.pyplot as plt
+import random
 
+import torch.nn as nn
+import torch.optim as optim
+import logging
+import torchvision.models as models
 
+def normalize(img):
+    return (img - img.min()) / (img.max() - img.min() + 1e-8)
+    
 def save_image(source, folder_path, image_name):
     source = source.clone()
     for i in range(source.size(0)):  # Iterate over the batch dimension
@@ -55,6 +67,7 @@ def save_image(source, folder_path, image_name):
 
     save_path = os.path.join(folder_path, f'{image_name}.png')
     plt.imsave(save_path, numpy_image)
+    return
 
 
 # Example usage
@@ -64,24 +77,7 @@ image_name = "example_image.png"
 
 # save_image_without_pillow(tensor_image, folder_path, image_name)
 
-class DataTransformCoils:
-    def __init__(self, resolution):
-        self.resolution = resolution
 
-    def __call__(self, kspace, target, attrs, fname, slice):
-        kspace = transforms.to_tensor(kspace)
-        image = transforms.ifft2_regular(kspace)
-        image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
-        image, mean, std = transforms.normalize_instance(image, eps=1e-11)
-        target = transforms.to_tensor(target)
-        target, mean, std = transforms.normalize_instance(target, eps=1e-11)
-        mean = std = 0
-
-
-
-        if target.shape[1] != self.resolution:
-            target = transforms.center_crop(target, (self.resolution, self.resolution))
-        return image , target, mean, std, attrs['norm'].astype(np.float32)
 
 class DataTransform:
     def __init__(self, resolution):
@@ -91,16 +87,12 @@ class DataTransform:
         kspace = transforms.to_tensor(kspace)
         image = transforms.ifft2_regular(kspace)
         image = transforms.complex_center_crop(image, (self.resolution, self.resolution))
-        image, mean, std = transforms.normalize_instance(image, eps=1e-11)
-        target = transforms.to_tensor(target)
-        target, mean, std = transforms.normalize_instance(target, eps=1e-11)
+        target = normalize(transforms.to_tensor(target))
         mean = std = 0
-
-
 
         if target.shape[1] != self.resolution:
             target = transforms.center_crop(target, (self.resolution, self.resolution))
-        return image.mean(0) , target, mean, std, attrs['norm'].astype(np.float32)
+        return fastmri.rss(image), target, mean, std, attrs['norm'].astype(np.float32)
 
 
 def create_datasets(args):
@@ -114,7 +106,7 @@ def create_datasets(args):
     dev_data = SliceData(
         root=args.data_path / f'multicoil_val',
         transform=DataTransform(args.resolution),
-        sample_rate=args.sample_rate)
+        sample_rate=1)
 
     return dev_data, train_data
 
@@ -181,51 +173,99 @@ def optimize_trajectory(args, model):
 
     print("Training completed!, took it from: ", init_loss," to: ", acc_loss + vel_loss)
 
-def pgd_attack_with_trajectory(model, input_tensor, target_tensor, epsilon, steps=10):
-    initial_trajectory = model.module.subsampling.x.detach().clone()
-    trajectory_param = model.module.subsampling.x
-    trajectory_param.requires_grad = True
 
-    output = model(input_tensor.unsqueeze(1))
-    if output.shape != target_tensor.shape:
-        target_tensor = target_tensor.view_as(output)
+def pgd_attack_with_trajectory(args, model, input_tensor, target_tensor, epsilon, steps=10, norm='linf'):
+    assert input_tensor is not None, "Input tensor is None!"
+    assert torch.is_tensor(input_tensor), f"Expected tensor, got {type(input_tensor)}"
 
-    init_psnr = psnr(target_tensor.to('cpu').numpy(), output.cpu().detach().numpy())
+    device = args.device
+    model = model.to(device)
+    input_tensor = input_tensor.to(device)
+    target_tensor = target_tensor.to(device)
+
+    alpha = epsilon / steps
+    original_trajectory = model.module.subsampling.x.detach().clone()
+    perturbation = torch.zeros_like(original_trajectory, requires_grad=True).to(device)
+
     lowest_psnr = float('inf')
-    best_trajectory = initial_trajectory.clone().data.detach()
+    best_perturbation = torch.zeros_like(perturbation)
 
     for _ in range(steps):
-        if model.module.subsampling.x.grad != None:
+        perturbed_trajectory = original_trajectory + perturbation
+        perturbed_trajectory = torch.clamp(perturbed_trajectory, min=-160, max=160)
+
+        if model.module.subsampling.x.grad is not None:
             model.module.subsampling.x.grad.zero_()
 
+
+        model.module.subsampling.x.data = perturbed_trajectory
         output = model(input_tensor.unsqueeze(1))
-        if output.shape != target_tensor.shape:
-            target_tensor = target_tensor.view_as(output)
+        target = target_tensor.view_as(output) if output.shape != target_tensor.shape else target_tensor
 
-        loss = F.l1_loss(output.to("cpu"), target_tensor.to("cpu"))
-        psnr_value = psnr(target_tensor.to('cpu').numpy(), output.cpu().detach().numpy())
+        loss = F.l1_loss(output.to(device), target.to(device))
+        current_psnr = psnr(target.detach().cpu().numpy(),
+                            output.detach().cpu().numpy())
 
-        if psnr_value < lowest_psnr:
-            lowest_psnr = psnr_value
-            best_trajectory = model.module.subsampling.x.data.clone().detach()
+        if current_psnr < lowest_psnr:
+            lowest_psnr = current_psnr
+            best_perturbation = perturbation.detach().clone()
 
-        grad = torch.autograd.grad(loss, model.module.subsampling.x, retain_graph=True)[0]
+        loss.backward()
 
-        trajectory = model.module.subsampling.x.data + grad.sign()
+        if norm == 'linf':
+            perturbation.data = perturbation.data + alpha * model.module.subsampling.x.grad.sign()
+            perturbation.data = torch.clamp(perturbation.data, -epsilon, epsilon)
 
-        eta = torch.clamp(trajectory - initial_trajectory, min=-epsilon, max=epsilon)
+        elif norm == 'l2':
+            grad = model.module.subsampling.x.grad
+            l2_norm = torch.norm(grad.view(grad.shape[0], -1), p=2, dim=1)
+            normalized_grad = grad / (l2_norm.view(-1, 1, 1) + 1e-10)
+            perturbation.data = perturbation.data + alpha * normalized_grad
+            perturbation.data = project_l2(perturbation.data, epsilon)
+        elif norm == 'l1':
+            grad = model.module.subsampling.x.grad
+            perturbation.data = perturbation.data + alpha * grad.sign()
+            perturbation.data = project_l1(perturbation.data, epsilon)
+        else:
+            raise ValueError(f"Unsupported norm: {norm}")
 
-        trajectory = initial_trajectory + eta
+    # Restore original trajectory
+    model.module.subsampling.x.data = original_trajectory.data
+    model.module.subsampling.attack_trajectory = best_perturbation
+    print(lowest_psnr, best_perturbation is None)
+    return
 
-        trajectory = torch.clamp(trajectory, min=-160, max=160)
 
-        model.module.subsampling.x.data = trajectory
+def project_linf(perturbation, epsilon):
+    return torch.clamp(perturbation, -epsilon, epsilon)
 
-        del loss, output  # Delete unnecessary tensors after use
-        torch.cuda.empty_cache()
 
-    model.module.subsampling.x = torch.nn.Parameter(initial_trajectory, requires_grad=True)  # Restore original
-    return best_trajectory - initial_trajectory
+def project_l2(perturbation, epsilon):
+    flat = perturbation.view(perturbation.shape[0], -1)
+    norm = flat.norm(p=2, dim=1, keepdim=True)
+    factor = torch.min(torch.ones_like(norm), epsilon / (norm + 1e-10))
+    projected = flat * factor
+    return projected.view_as(perturbation)
+
+
+def project_l1(perturbation, epsilon):
+    original_shape = perturbation.shape
+    x_flat = perturbation.view(perturbation.shape[0], -1)
+    abs_x = torch.abs(x_flat)
+
+    sorted_x, _ = torch.sort(abs_x, descending=True, dim=1)
+    cumsum = torch.cumsum(sorted_x, dim=1)
+
+    rho = (sorted_x * torch.arange(1, x_flat.shape[1] + 1, device=x_flat.device)) > (cumsum - epsilon)
+    rho_idx = rho.sum(dim=1) - 1
+    theta = (cumsum.gather(1, rho_idx.unsqueeze(1)) - epsilon) / (rho_idx + 1).float().unsqueeze(1)
+    theta = torch.clamp(theta, min=0)
+
+    projected = torch.sign(x_flat) * torch.clamp(abs_x - theta, min=0)
+    return projected.view(original_shape)
+
+
+
 
 def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
@@ -266,23 +306,33 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     start_epoch = start_iter = time.perf_counter()
     print(f'a_max={args.a_max}, v_max={args.v_max}')
 
+    done = False
     for iter, data in enumerate(data_loader):
         torch.cuda.empty_cache()
         optimizer.zero_grad()
-
+            
         input, target, mean, std, norm = data
+        if input is None:
+            print("skipping")
+            continue
+
+        noise = torch.zeros_like(input)
+        if (args.noise_behaviour == "image" or args.noise_behaviour == "noiseImage") and random.random() <= (1 - args.noise_p):
+            print("applied image!")
+            noise = torch.randn_like(input) * args.std_image
+
+        input = input + noise
         input = input.to(args.device)
         target = target.to(args.device)
 
-        if args.noise_behaviour == "PGD":
-            model.module.subsampling.attack_trajectory = pgd_attack_with_trajectory(model, input, target, model.module.subsampling.epsilon, args.noise_steps)
-            optimizer = build_optim(args, model)
+        if args.noise_behaviour == "PGD" or args.noise_behaviour == "PGDANDIMAGE":
+            pgd_attack_with_trajectory(args, model, input, target, model.module.subsampling.epsilon, args.noise_steps)
 
         output = model(input.unsqueeze(1))
         x = model.module.get_trajectory()
-        v, a = get_vel_acc(x)
-        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
-        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max).abs() + 1e-8, 2)))
+        # v, a = get_vel_acc(x)
+        # acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
+        # vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max).abs() + 1e-8, 2)))
         resolution = target.shape[-1]
 
         if epoch <= 10:
@@ -299,7 +349,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         elif epoch <= 30:
             acc_weight = 1e-1
 
-        if iter % 100:
+        if not done:
+            done = True
             save_dir = f"Images_{args.model}/{args.test_name}/{epoch}"
             os.makedirs(save_dir, exist_ok=True)
             save_path = f"{save_dir}/{iter}.png"
@@ -318,7 +369,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         if args.TSP and epoch < args.TSP_epoch:
             loss = args.rec_weight * rec_loss
         else:
-            loss = args.rec_weight * rec_loss + args.vel_weight * vel_loss + args.acc_weight * acc_loss
+            loss = args.rec_weight * rec_loss #+ args.vel_weight * vel_loss + args.acc_weight * acc_loss
 
         #if vel_loss + acc_loss > 1e-3:
         #    optimize_trajectory(args, model)
@@ -328,7 +379,9 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         #print("after backprop:", model.module.subsampling.x)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
         optimizer.step()
-
+        if args.initialization == 'cartesian':
+            model.module.subsampling.apply_binary_grad(optimizer.param_groups[0]['lr'])
+        model.module.subsampling.attack_trajectory = None
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
         # writer.add_scalar('TrainLoss', loss.item(), global_step + iter)
@@ -338,12 +391,12 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
                 f'Epoch = [{epoch:3d}/{args.num_epochs:3d}] '
                 f'Iter = [{iter:4d}/{len(data_loader):4d}] '
                 f'Loss = {loss.item():.4g} Avg Loss = {avg_loss:.4g} '
-                f'rec_loss: {rec_loss:.4g}, vel_loss: {vel_loss:.4g}, acc_loss: {acc_loss:.4g}'
                 f'PSNR: {np.mean(psnr_l):.2f} +- {np.std(psnr_l):.2f}, SSIM: {np.mean(ssim_l):.4f} +- {np.std(ssim_l):.4f}'
             )
         start_iter = time.perf_counter()
     if scheduler:
         scheduler.step()
+    print(optimizer.param_groups[0]['lr'], (optimizer.param_groups[1]['lr']))
     return avg_loss, time.perf_counter() - start_epoch
 
 
@@ -353,6 +406,7 @@ def evaluate(args, epoch, model, data_loader, writer):
     psnr_l = []
     ssim_l = []
 
+    print("Halo", len(data_loader))
     start = time.perf_counter()
     with torch.no_grad():
         if epoch > 0:
@@ -361,8 +415,6 @@ def evaluate(args, epoch, model, data_loader, writer):
                 input = input.to(args.device)
                 resolution = target.shape[-1]
                 target = target.to(args.device)
-                target = transforms.reflect_pad_to_shape(target.unsqueeze(0), (resolution, resolution))
-
                 output = model(input.unsqueeze(1))
                 recons = output.to('cpu').squeeze(1).view(target.shape)
                 recons = recons.squeeze()
@@ -372,28 +424,27 @@ def evaluate(args, epoch, model, data_loader, writer):
                 losses.append(loss.item())
                 target = target.view(-1,resolution,resolution)
                 recons = recons.view(target.shape)
-
-                psnr_l.append(psnr(target.to('cpu').numpy(), recons.numpy()))
-                ssim_l.append(ssim(target.to('cpu').numpy(), recons.numpy()))
+                psnr_l.append(psnr(target.detach().cpu().numpy(), recons.detach().cpu().numpy()))
+                ssim_l.append(ssim(target.detach().cpu().numpy(), recons.detach().cpu().numpy()))
 
         print(
             f'PSNR: {np.mean(psnr_l):.2f} +- {np.std(psnr_l):.2f}, SSIM: {np.mean(ssim_l):.4f} +- {np.std(ssim_l):.4f}')
         x = model.module.get_trajectory()
-        v, a = get_vel_acc(x)
-        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max), 2)))
-        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max), 2)))
+        # v, a = get_vel_acc(x)
+        # acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max), 2)))
+        # vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, args.v_max), 2)))
         rec_loss = np.mean(losses)
 
         writer.add_scalar('Rec_Loss', rec_loss, epoch)
-        writer.add_scalar('Acc_Loss', acc_loss.detach().cpu().numpy(), epoch)
-        writer.add_scalar('Vel_Loss', vel_loss.detach().cpu().numpy(), epoch)
-        writer.add_scalar('Total_Loss',
-                          rec_loss + acc_loss.detach().cpu().numpy() + vel_loss.detach().cpu().numpy(), epoch)
+        # writer.add_scalar('Acc_Loss', acc_loss.detach().cpu().numpy(), epoch)
+        # writer.add_scalar('Vel_Loss', vel_loss.detach().cpu().numpy(), epoch)
+        #writer.add_scalar('Total_Loss',
+        #                  rec_loss + acc_loss.detach().cpu().numpy() + vel_loss.detach().cpu().numpy(), epoch)
 
         psnr_mean, psnr_std = np.mean(psnr_l), np.std(psnr_l)
         ssim_mean, ssim_std = np.mean(ssim_l), np.std(ssim_l)
         x = model.module.get_trajectory()
-        v, a = get_vel_acc(x)
+        #v, a = get_vel_acc(x)
         if args.TSP and epoch < args.TSP_epoch:
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
         else:
@@ -408,9 +459,9 @@ def evaluate(args, epoch, model, data_loader, writer):
             plt.close(trajectory)
             writer.add_figure('Trajectory', plot_trajectory(x.detach().cpu().numpy()), epoch)
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
-        writer.add_figure('Accelerations_plot', plot_acc(a.cpu().numpy(), args.a_max), epoch)
-        writer.add_figure('Velocity_plot', plot_acc(v.cpu().numpy(), args.v_max), epoch)
-        writer.add_text('Coordinates', str(x.detach().cpu().numpy()).replace(' ', ','), epoch)
+        # writer.add_figure('Accelerations_plot', plot_acc(a.cpu().numpy(), args.a_max), epoch)
+        # writer.add_figure('Velocity_plot', plot_acc(v.cpu().numpy(), args.v_max), epoch)
+        #writer.add_text('Coordinates', str(x.detach().cpu().numpy()).replace(' ', ','), epoch)
     if epoch == 0:
         return None, time.perf_counter() - start
     else:
@@ -473,13 +524,14 @@ def visualize(args, epoch, model, data_loader, writer):
             break
 
 
-def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best):
+def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best):
     torch.save(
         {
             'epoch': epoch,
             'args': args,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'best_dev_loss': best_dev_loss,
             'best_psnr_mean': best_psnr_mean,
             'best_ssim_mean': best_ssim_mean,
@@ -516,11 +568,12 @@ def build_model(args):
         embed_dim=args.embed_dim,
         num_blocks=args.num_blocks,
         sample_per_shot=args.sample_per_shot,
-        noise_mode = args.noise_mode,
         epsilon = args.epsilon,
         epsilon_step = epsilon_step,
-        noise_type = args.noise_type,
-        noise_p = args.noise_p
+        noise_p = 0 if (args.noise_behaviour != "noiseImage" and args.noise_behaviour != "noise" and args.noise_behaviour != "PGD") else args.noise_p,
+        std = args.std,
+        acceleration=args.acceleration,
+        center_fraction=args.center_fraction
     ).to(args.device)
     return model
 
@@ -541,7 +594,21 @@ def load_model(checkpoint_file):
 def build_optim(args, model):
     optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
                                   {'params': model.module.reconstruction_model.parameters()}], args.lr)
+    
     return optimizer
+
+def build_scheduler(optimizer, args):
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[args.sub_lr, args.lr],  # One per param group
+        total_steps=args.num_epochs,    # = 40
+        pct_start= 0.1,  # = 0.1 for 4 warmup epochs
+        anneal_strategy='linear',       # linear decay after warmup
+        cycle_momentum=False,           # disable momentum scheduling
+        div_factor=10,                   # base_lr = max_lr / div_factor (i.e., start at 0)
+        final_div_factor=10             # decay linearly to ~0
+    )
+    return scheduler
 
 
 def eval(args, model, data_loader):
@@ -589,6 +656,13 @@ def train():
 
     print(args.test_name, flush=True)
     args.checkpoint = f'summary/{args.test_name}/model.pt'
+    optimizer = None
+    g_params = None
+    g_optimizer = None
+    d_optimizer = None
+    d_scheduler = None
+    g_scheduler = None
+
     if args.resume:
         checkpoint, model, optimizer = load_model(args.checkpoint)
         # args = checkpoint['args']
@@ -601,7 +675,16 @@ def train():
         model = build_model(args)
         if args.data_parallel:
             model = torch.nn.DataParallel(model)
+        if "pretrain" in args.model:
+            path = ""
+            if "cartesian" in args.model and "vit-l" in args.model:
+                path = "models/vit-l_equidist_acc4/checkpoint.pth"
+            checkpoint = torch.load(path)
+            model.module.reconstruction_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer = build_optim(args, model)
+        scheduler = build_scheduler(optimizer, args)
+
+
         best_dev_loss = 1e9
         best_psnr_mean = 0
         best_ssim_mean = 0
@@ -613,27 +696,29 @@ def train():
     train_loader, dev_loader, display_loader = create_data_loaders(args)
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
     print("started mid point", flush=True)
+
+        
     for epoch in range(start_epoch, args.num_epochs):
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
-        print("epoch: ", epoch, "current noise level: ", model.module.subsampling.epsilon, "started", flush=True)
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, None)
+        #print("epoch: ", epoch, "current noise level: ", model.module.subsampling.epsilon, "current std: ", model.module.subsampling.std, "started", flush=True)
+        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, scheduler)
         dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer)
 
-        if psnr_mean > best_psnr_mean:
+        if best_psnr_mean < psnr_mean:
             is_new_best = True
             best_psnr_mean = psnr_mean
             best_ssim_mean = ssim_mean
             best_epoch = epoch + 1
         else:
             is_new_best = False
-        save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best)
+        save_model(args, args.exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best)
         logging.info(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
         )
 
-        if noise_behaviour == "linear":
+        if noise_behaviour == "linear_PGD":
             model.module.increase_noise_linearly()
 
     print(args.test_name)
@@ -679,7 +764,7 @@ def create_arg_parser():
     parser.add_argument('--sub-lr', type=float, default=1e-1, help='lerning rate of the sub-samping layel')
 
     # trajectory learning parameters
-    parser.add_argument('--trajectory-learning', default=True,
+    parser.add_argument('--trajectory-learning', default=1,
                         help='trajectory_learning, if set to False, fixed trajectory, only reconstruction learning.')
     parser.add_argument('--acc-weight', type=float, default=1e-2, help='weight of the acceleration loss')
     parser.add_argument('--vel-weight', type=float, default=1e-1, help='weight of the velocity loss')
@@ -722,6 +807,10 @@ def create_arg_parser():
     parser.add_argument('--noise-type', type=str, default='l1', help='Type of noise to be added (e.g., "l1", "l2")')
     parser.add_argument('--noise-p', type=float, default=0, help='Probability of applying noise during training')
     parser.add_argument('--noise-steps', type=int, default=0, help='The number of PGD steps to apply noise during training')
+    parser.add_argument('--std', type=int, default=0, help='The std of the normal noise')
+    parser.add_argument('--std-image', type=int, default=0, help='The std of the normal noise on the image')
+    parser.add_argument('--acceleration', type=int, default=4, help='The Cartesian Acceleration')
+    parser.add_argument('--center-fraction', type=float, default=0.08, help='The Cartesian Center Fraction')
     return parser
 
 
