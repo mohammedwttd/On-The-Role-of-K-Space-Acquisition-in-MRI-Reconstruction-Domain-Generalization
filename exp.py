@@ -9,16 +9,16 @@ from sympy.physics.units import acceleration
 data_path = '/mnt/walkure_public/users/mohammedw/fastmri_downloads/'
 
 model = 'Unet'
-sub_lr = 0.025
+init = 'radial'
+sub_lr = 0.1 if 'cartesian' in init else 0.01
 rec_lr = 1e-4 * 5 if "pretrained" not in model else 0.0001
 acc_weight = 0.005
 vel_weight = 0.001
-batch_size = 1 if 'vit' in model else 30
-init = 'cartesian'
+batch_size = 1
 n_shots = 16
-trajectory_learning = 0 if "pretrained" in model else 1
+trajectory_learning = 1 if "pretrained" in model else 1
 num_epochs = 30 if "pretrained" in model else 40
-sample_rate = 0.1 if "pretrained" in model else 1
+sample_rate = 1 if "pretrained" in model else 1
 TSP = ''
 SNR = ''
 weight_decay = 0
