@@ -27,6 +27,7 @@ class SliceData(Dataset):
 
         files = list(pathlib.Path(root).iterdir())
         if sample_rate < 1:
+            random.seed(42)
             random.shuffle(files)
             num_files = round(len(files) * sample_rate)
             files = files[:num_files]

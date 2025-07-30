@@ -8,21 +8,101 @@ from sympy.physics.units import acceleration
 
 data_path = '/mnt/walkure_public/users/mohammedw/fastmri_downloads/'
 
-model = 'Unet'
-init = 'radial'
-sub_lr = 0.1 if 'cartesian' in init else 0.01
-rec_lr = 1e-4 * 5 if "pretrained" not in model else 0.0001
+lr = {
+    'Unet': {
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.05,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 20,
+            'radial': 80,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'vit-l-pretrained-cartesian-decoder': {
+        'rec_lr': 1e-4,
+        'sub_lr': {
+            'cartesian': 0.05,
+            'radial': 0.0025
+        }
+    },
+    'vit-l-pretrained-cartesian': {
+        'rec_lr': 1e-4,
+        'sub_lr': {
+            'cartesian': 0.1,
+            'radial': 0.01
+        },
+        'noise': {
+            'cartesian': 20,
+            'radial': 80,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'vit-l-pretrained-radial': {
+        'rec_lr': 1e-4,
+        'sub_lr': {
+            'cartesian': 0.1,
+            'radial': 0.01
+        },
+        'noise': {
+            'cartesian': 20,
+            'radial': 80,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'vit-l': {
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.1,
+            'radial': 0.01
+        },
+        'noise': {
+            'cartesian': 20,
+            'radial': 80,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+}
+
+
+
 acc_weight = 0.005
 vel_weight = 0.001
 batch_size = 1
 n_shots = 16
-trajectory_learning = 1 if "pretrained" in model else 1
+
+model = 'vit-l-pretrained-cartesian'
+init = 'cartesian'
+noise = ''
+noise_behaviour = ''
+
 num_epochs = 30 if "pretrained" in model else 40
-sample_rate = 1 if "pretrained" in model else 1
+trajectory_learning = 1
+sample_rate = 0.1 if "pretrained" in model else 1
+
+clr = lr[model]
+sub_lr = clr['sub_lr'][init]
+rec_lr = clr['rec_lr']
+noise_std = clr['noise'][noise] if noise != '' else 0
+
 TSP = ''
 SNR = ''
 weight_decay = 0
-inter_gap_mode = "changing_downwards"
+inter_gap_mode = "changing_downwards_20"
 interp_gap = 10
 acceleration = 4
 center_fraction = 0.08
@@ -42,15 +122,32 @@ embed_dim = 66
 
 #noise
 noise_mode = None
-noise_behaviour = "constant"
-std = 0
-std_image = 0
 epsilon = 0
-end_epsilon = 1e8
+noise_p = 0
+
+if 'pgd' in noise:
+    noise_behaviour += "_" + noise
+    epsilon = noise_std
+    noise_p = 0.5
+
+if init == 'radial' and noise == 'radial':
+    epsilon = noise_std
+    noise_behaviour += "_noise"
+    noise_p = 0.5
+
+if init == 'cartesian' and noise == 'cartesian':
+    epsilon = noise_std
+    noise_behaviour += "_noise"
+    noise_p = 0.5
+
+if noise == 'image':
+    epsilon = noise_std
+    noise_behaviour += "_image"
+    noise_p = 0.5
+
+
 noise_type = "linf"
-noise_steps = 10
-noise_p = 0.5
-test_name = f'{n_shots}/{init}_'
+test_name = f'{n_shots}/{init}_{sample_rate}_'
 
 if init == "cartesian":
     test_name += f'{acceleration}_{center_fraction}_'
@@ -68,36 +165,9 @@ if TSP == '--TSP':
 if SNR == '--SNR':
     test_name += '_SNR_flat_0.01'
 
-if epsilon != 0 and noise_behaviour == "PGD":
-    test_name += f"_{noise_mode}"
-    if noise_behaviour == "constant":
-        test_name += "_constant_noise"
-
-    if noise_behaviour == "linear":
-        test_name += "_linear_noise"
-
-    if noise_behaviour == "log":
-        test_name += "_log_noise"
-
-    test_name += "_PGD_noise"
-    test_name += f"_steps{noise_steps}"
-
-    test_name += f'_start_epsilon{epsilon}'
-
-    if noise_behaviour == "linear":
-        test_name += f'_end_epsilon{end_epsilon}'
-
-    test_name += f'_noise_type{noise_type}'
-
-    if noise_p == -1:
-        test_name += f'_probabilistic_model'
-    else:
-        test_name += f'_P{noise_p}'
-
-if std != 0:
+if epsilon != 0:
     test_name += f"_{noise_behaviour}"
-    test_name += f"_std_{std}"
-    test_name += f"_std_image{std_image}"
+    test_name += f"_intensity_{epsilon}"
     test_name += f"_noise_p_{noise_p}"
 
 command = f'python3 train.py --test-name={test_name} ' \
@@ -127,12 +197,8 @@ command = f'python3 train.py --test-name={test_name} ' \
           f'--noise-mode={noise_mode} ' \
           f'--noise-behaviour={noise_behaviour} ' \
           f'--epsilon={epsilon} ' \
-          f'--end-epsilon={end_epsilon} ' \
           f'--noise-type={noise_type} '  \
           f'--noise-p={noise_p} '  \
-          f'--noise-steps={noise_steps} '  \
-          f'--std={std} '  \
-          f'--std-image={std_image} '  \
           f'--acceleration={acceleration} '  \
           f'--center-fraction={center_fraction}'
 

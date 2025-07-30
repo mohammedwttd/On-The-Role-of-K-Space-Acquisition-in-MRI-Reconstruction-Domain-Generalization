@@ -29,6 +29,93 @@ import torch
 import torchvision
 import matplotlib.pyplot as plt
 
+class NoiseScheduler:
+    def __init__(
+        self,
+        max_noise: float,
+        warmup_steps: int = 4,
+        total_steps: int = 0,
+        final_noise: float = 0.0,
+        constant_steps: int = 0,
+        mode: str = "linear",
+    ):
+        """
+        max_noise: Peak noise level.
+        warmup_steps: Steps to linearly warm up from 0 → max_noise.
+        total_steps: Total number of steps (including warmup and decay).
+        final_noise: Noise level at the end of decay.
+        constant_steps: Number of steps to keep noise constant after warmup.
+        mode: Type of schedule ("constant", "linear_decay", "cosine_decay").
+        static: If True, noise stays at max_noise always (ignores warmup/decay).
+        """
+        self.max_noise = max_noise
+        self.warmup_steps = warmup_steps
+        self.constant_steps = constant_steps
+        self.total_steps = total_steps
+        self.final_noise = final_noise
+        self.mode = mode
+        self.step_count = 0
+        self.static = False
+        if "linear" not in mode and "constant" not in mode:
+            self.static = True
+
+    def step(self):
+        self.step_count += 1
+
+    def get_noise(self):
+        if self.static:  # <-- Static mode
+            return self.max_noise
+
+        t = self.step_count
+
+        # 1. Warmup phase
+        if t < self.warmup_steps:
+            return self.max_noise * (t / self.warmup_steps)
+
+        # 2. Constant phase
+        elif t < self.warmup_steps + self.constant_steps:
+            return self.max_noise
+
+        # 3. Decay phase
+        else:
+            decay_t = t - (self.warmup_steps + self.constant_steps)
+            decay_steps = max(1, self.total_steps - (self.warmup_steps + self.constant_steps))
+
+            if "constant" in self.mode:
+                return self.max_noise
+            elif "linear" in self.mode:
+                ratio = max(0.0, 1 - decay_t / decay_steps)
+                return self.final_noise + (self.max_noise - self.final_noise) * ratio
+            elif "cosine" in self.mode:
+                from math import cos, pi
+                ratio = 0.5 * (1 + cos(pi * decay_t / decay_steps))
+                return self.final_noise + (self.max_noise - self.final_noise) * ratio
+            else:
+                raise ValueError(f"Unknown mode: {self.mode}")
+
+def perturb_Bimask(Bimask, move_std=20):
+    _, _, H, _, _ = Bimask.shape
+    Bimask = Bimask.clone()
+    perturbed = Bimask.clone()
+
+    selected_rows = (Bimask[0, 0, :, 0, 0] == 1).nonzero(as_tuple=False).squeeze(-1)
+    occupied = set(selected_rows.tolist())
+
+    for y in selected_rows.tolist():
+        for _ in range(10):
+            eps = torch.randn((1,))
+            sample = move_std * eps
+            shift = int(round(sample.item()))
+            y_new = y + shift
+            if 0 <= y_new < H and y_new not in occupied:
+                perturbed[0, 0, y, 0, 0] = 0
+                perturbed[0, 0, y_new, 0, 0] = 1
+                occupied.remove(y)
+                occupied.add(y_new)
+                break
+
+    noise_mask = (perturbed != Bimask).float()
+    return noise_mask
 def normalize(img):
     return (img - img.min()) / (img.max() - img.min() + 1e-8)
 
@@ -69,7 +156,7 @@ class SubsamplingBinary(nn.Module):
         mask = mask * 0.5 + 0.5 * rng.uniform(size=num_cols)
         return torch.tensor(mask, dtype=torch.float)
 
-    def __init__(self, res, acceleration=4, center_fraction=0.08, momentum=0.9, use_random=False, trajectory_learning = True):
+    def __init__(self, res, acceleration=4, center_fraction=0.08, momentum=0.9, use_random=False, trajectory_learning = True, noise_cartesian = 0, noise_p = 0, noise_model = None):
         super().__init__()
         self.res = res
         self.acceleration = acceleration
@@ -84,6 +171,10 @@ class SubsamplingBinary(nn.Module):
         Bimask_1 = torch.tensor(mask)
         self.Bimask = torch.nn.Parameter(torch.reshape(Bimask_1, mask_shape), requires_grad=bool(int(trajectory_learning)))
         self.trajectory_learning = bool(int(trajectory_learning))
+        self.noise_cartesian = noise_cartesian
+        self.noise_p = noise_p
+        self.noise_model = noise_model
+        self.attack_trajectory_cartesian = None
 
     def get_mask(self):
         res = self.res
@@ -118,13 +209,32 @@ class SubsamplingBinary(nn.Module):
         input_c = fastmri.fft2c(input).clone()  # Clone to avoid view issues
         if input_c.device != self.Bimask.device:
             self.Bimask = self.Bimask.to(input_c.device)
-        input_c_m = input_c * self.Bimask
+
+        mask = None
+        noise_mask_rand = None
+        if self.attack_trajectory_cartesian is not None:
+            mask = self.attack_trajectory_cartesian
+            print("applied cartesian noise adv", self.noise_model.get_noise())
+
+        elif random.random() < self.noise_p and (self.training) and self.noise_model.get_noise() > 0:
+            print("applied cartesian noise ", self.noise_model.get_noise())
+            noise = self.noise_model.get_noise()
+            mask = perturb_Bimask(self.Bimask, noise)
+
+        if mask is not None:
+            noise_mask_rand = self.Bimask * (1 - mask) + (1 - self.Bimask) * mask
+
+        if noise_mask_rand != None:
+            input_c_m = input_c * noise_mask_rand
+        else:
+            input_c_m = input_c * self.Bimask
+
         return self.transform(input_c_m)
 
     def apply_binary_grad(self, lr):
         if not self.trajectory_learning:
             return
-        print("got here")
+
         self.velocity = self.momentum * self.velocity.to("cuda") + (1 - self.momentum) * self.Bimask.grad[0, 0, :, 0, 0]
         new_mask = self.mask - lr * self.velocity
         new_mask = torch.clamp(new_mask, -1, 1)
@@ -183,7 +293,7 @@ class Subsampling_Layer(nn.Module):
         return
 
     def __init__(self, decimation_rate, res, trajectory_learning, initialization, n_shots, interp_gap, SNR=False,
-                 projection_iters=10, sample_per_shot = 3001, interp_gap_mode = 0, epsilon = 0, epsilon_step = None, noise_p = 0, std = 0):
+                 projection_iters=10, sample_per_shot = 3001, interp_gap_mode = 0, epsilon = 0, noise_p = 0, noise_model = None):
         super().__init__()
 
         random.seed(42)
@@ -196,36 +306,24 @@ class Subsampling_Layer(nn.Module):
         self.interp_gap = interp_gap
         self.iters = projection_iters
         self.epsilon = epsilon
-        self.epsilon_step = epsilon_step
         self.noise_p = noise_p
-        self.attack_trajectory = None
-        self.std = std
-        print(noise_p)
-
-    def increase_noise_linearly(self):
-        """
-        Linearly increases the noise magnitude epsilon over the specified steps.
-
-        The magnitude increases from the initial value up to the target value at the final step.
-        """
-        if self.epsilon == 0:
-            return
-
-        self.epsilon += self.epsilon_step
-        return self.epsilon
-
+        self.attack_trajectory_radial = None
+        self.noise_model = noise_model
 
     def add_normed_noise(self, x_full):
-        if self.noise_p >= 0 and (not self.training or random.random() <= (1 - self.noise_p)):
+        if not self.training:
             return x_full
 
-        if self.epsilon > 0 and self.attack_trajectory != None:
+        if self.attack_trajectory_radial != None:
             print("applied PGD!")
-            return  torch.clamp(self.attack_trajectory.reshape(-1, 2) + x_full, min=-160, max=160)
+            return  torch.clamp(self.attack_trajectory_radial.reshape(-1, 2) + x_full, min=-160, max=160)
 
-        elif self.std > 0:
-            print("applied std path!")
-            scaled_noise = torch.randn_like(x_full) * self.std
+        if self.noise_p >= 0 and (random.random() <= (1 - self.noise_p)):
+            return x_full
+
+        elif self.noise_model.get_noise() > 0:
+            print("applied std path! ", self.noise_model.get_noise())
+            scaled_noise = torch.randn_like(x_full) * self.noise_model.get_noise()
             noisy_x = x_full + scaled_noise
             noisy_x = torch.clamp(noisy_x, min=-160, max=160)
             return noisy_x
@@ -242,7 +340,7 @@ class Subsampling_Layer(nn.Module):
                 for d in range(2):
                     self.x.data[shot, :, d] = self.interp(t1, x_short[shot, :, d], t)
 
-        x_full = self.add_normed_noise(self.x.reshape(-1,2))
+        x_full = torch.clamp(self.add_normed_noise(self.x.reshape(-1,2)), min=-160, max=160)
 
         input = input.permute(0, 1, 4, 2, 3)
         sub_ksp = nufft(input, x_full)
@@ -292,19 +390,19 @@ class Subsampling_Model(nn.Module):
     def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob, decimation_rate, res,
                  trajectory_learning, initialization, n_shots, interp_gap, SNR=False, type=None,
                  img_size=(320, 320) ,window_size=10, embed_dim=66, num_blocks=1, sample_per_shot=3001,
-                 epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08):
+                 epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08, noise ="", epochs = 40):
         super().__init__()
         self.type = type
+        self.noise_model = NoiseScheduler(epsilon,warmup_steps=4, total_steps=epochs, final_noise=0, constant_steps=0, mode = noise)
         if initialization != "cartesian":
             self.subsampling = Subsampling_Layer(decimation_rate, res, trajectory_learning, initialization, n_shots,
-                                                 interp_gap, SNR, sample_per_shot = sample_per_shot, epsilon = epsilon,
-                                                 epsilon_step = epsilon_step, noise_p = noise_p, std = std)
+                                                 interp_gap, SNR, sample_per_shot = sample_per_shot, epsilon = epsilon, noise_p = noise_p, noise_model = self.noise_model)
         else:
-            self.subsampling = SubsamplingBinary(img_size[0], acceleration, center_fraction, trajectory_learning = trajectory_learning).to("cuda")
-            
+            self.subsampling = SubsamplingBinary(img_size[0], acceleration, center_fraction, trajectory_learning = trajectory_learning, noise_cartesian=std, noise_p=noise_p, noise_model = self.noise_model).to("cuda")
+
         if 'vit' in type:
             if "vit-l" in type:
-                avrg_img_size = 340 if "pretrain" in type else 320
+                avrg_img_size = 320 if "pretrain" in type else 320
                 patch_size = 10
                 depth = 10
                 num_heads = 16

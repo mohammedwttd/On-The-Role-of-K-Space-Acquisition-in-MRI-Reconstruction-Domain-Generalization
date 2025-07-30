@@ -174,66 +174,104 @@ def optimize_trajectory(args, model):
     print("Training completed!, took it from: ", init_loss," to: ", acc_loss + vel_loss)
 
 
-def pgd_attack_with_trajectory(args, model, input_tensor, target_tensor, epsilon, steps=10, norm='linf'):
-    assert input_tensor is not None, "Input tensor is None!"
-    assert torch.is_tensor(input_tensor), f"Expected tensor, got {type(input_tensor)}"
+from torch.optim import SGD
+import torch
+import torch.nn.functional as F
 
-    device = args.device
+
+def pgd_attack_on_trajectory(model, input_tensor, target_tensor, epsilon, alpha=1, steps=1, norm='linf'):
+    """
+    PGD attack directly on the trajectory perturbation (not on the trajectory itself).
+    """
+    from pytorch_nufft.nufft2 import nufft, nufft_adjoint
+    device = input_tensor.device
     model = model.to(device)
     input_tensor = input_tensor.to(device)
     target_tensor = target_tensor.to(device)
 
-    alpha = epsilon / steps
+    # Clone original trajectory
     original_trajectory = model.module.subsampling.x.detach().clone()
-    perturbation = torch.zeros_like(original_trajectory, requires_grad=True).to(device)
+
+    # Initialize perturbation as the variable we optimize
+    perturbation = torch.zeros_like(original_trajectory, device=device, requires_grad=True)
 
     lowest_psnr = float('inf')
     best_perturbation = torch.zeros_like(perturbation)
 
-    for _ in range(steps):
-        perturbed_trajectory = original_trajectory + perturbation
-        perturbed_trajectory = torch.clamp(perturbed_trajectory, min=-160, max=160)
+    for step in range(steps + 1):
+        # Apply current perturbation to trajectory
+        perturbed_trajectory = torch.clamp(original_trajectory + perturbation, -160, 160)
 
-        if model.module.subsampling.x.grad is not None:
-            model.module.subsampling.x.grad.zero_()
+        # Inject into model
+        x_full = perturbed_trajectory.reshape(-1, 2)
 
+        input = input_tensor.unsqueeze(0).permute(0, 1, 4, 2, 3)
+        sub_ksp = nufft(input, x_full)
+        output = nufft_adjoint(sub_ksp, x_full, input.shape)
+        output = output.permute(0, 1, 3, 4, 2)
+        output = transforms.complex_abs(output)
+        output = normalize(output)
 
-        model.module.subsampling.x.data = perturbed_trajectory
-        output = model(input_tensor.unsqueeze(1))
+        # Forward pass
+        output = model.module.reconstruction_model(output)
         target = target_tensor.view_as(output) if output.shape != target_tensor.shape else target_tensor
+        loss = F.l1_loss(output, target)
 
-        loss = F.l1_loss(output.to(device), target.to(device))
-        current_psnr = psnr(target.detach().cpu().numpy(),
-                            output.detach().cpu().numpy())
-
+        # Track lowest PSNR
+        current_psnr = psnr(target.detach().cpu().numpy(), output.detach().cpu().numpy())
         if current_psnr < lowest_psnr:
             lowest_psnr = current_psnr
             best_perturbation = perturbation.detach().clone()
 
+        if step == steps:
+            break
+
+        # Backward: compute gradient w.r.t. perturbation
+        if perturbation.grad is not None:
+            perturbation.grad.zero_()
         loss.backward()
 
-        if norm == 'linf':
-            perturbation.data = perturbation.data + alpha * model.module.subsampling.x.grad.sign()
-            perturbation.data = torch.clamp(perturbation.data, -epsilon, epsilon)
+        # Update perturbation using its own gradient
+        grad = perturbation.grad
 
-        elif norm == 'l2':
-            grad = model.module.subsampling.x.grad
-            l2_norm = torch.norm(grad.view(grad.shape[0], -1), p=2, dim=1)
-            normalized_grad = grad / (l2_norm.view(-1, 1, 1) + 1e-10)
-            perturbation.data = perturbation.data + alpha * normalized_grad
-            perturbation.data = project_l2(perturbation.data, epsilon)
-        elif norm == 'l1':
-            grad = model.module.subsampling.x.grad
-            perturbation.data = perturbation.data + alpha * grad.sign()
-            perturbation.data = project_l1(perturbation.data, epsilon)
+        if norm == 'linf':
+            perturbation.data += alpha * grad.sign()
+            perturbation.data = project_linf(perturbation.data, epsilon)
         else:
             raise ValueError(f"Unsupported norm: {norm}")
 
     # Restore original trajectory
-    model.module.subsampling.x.data = original_trajectory.data
-    model.module.subsampling.attack_trajectory = best_perturbation
-    print(lowest_psnr, best_perturbation is None)
-    return
+    model.module.subsampling.attack_trajectory_radial = best_perturbation
+
+
+# Projection functions (same as provided)
+def project_linf(perturbation, epsilon):
+    return torch.clamp(perturbation, -epsilon, epsilon)
+
+
+def project_l2(perturbation, epsilon):
+    flat = perturbation.view(perturbation.shape[0], -1)
+    norm = flat.norm(p=2, dim=1, keepdim=True)
+    factor = torch.min(torch.ones_like(norm), epsilon / (norm + 1e-10))
+    projected = flat * factor
+    return projected.view_as(perturbation)
+
+
+def project_l1(perturbation, epsilon):
+    original_shape = perturbation.shape
+    x_flat = perturbation.view(perturbation.shape[0], -1)
+    abs_x = torch.abs(x_flat)
+
+    sorted_x, _ = torch.sort(abs_x, descending=True, dim=1)
+    cumsum = torch.cumsum(sorted_x, dim=1)
+
+    rho = (sorted_x * torch.arange(1, x_flat.shape[1] + 1, device=x_flat.device)) > (cumsum - epsilon)
+    rho_idx = rho.sum(dim=1) - 1
+    theta = (cumsum.gather(1, rho_idx.unsqueeze(1)) - epsilon) / (rho_idx + 1).float().unsqueeze(1)
+    theta = torch.clamp(theta, min=0)
+
+    projected = torch.sign(x_flat) * torch.clamp(abs_x - theta, min=0)
+    return projected.view(original_shape)
 
 
 def project_linf(perturbation, epsilon):
@@ -264,40 +302,157 @@ def project_l1(perturbation, epsilon):
     projected = torch.sign(x_flat) * torch.clamp(abs_x - theta, min=0)
     return projected.view(original_shape)
 
+def perturb_Bimask_center_boundary_shift(
+    model,
+    num_move: int,
+    center_fraction: float = 0.04,
+):
+    """
+    Move up to `num_move` active lines closest to (but NOT inside) the central fraction band
+    to the extremes of k-space (top or bottom), preserving the center band.
 
+    Args:
+        Bimask: Tensor shape [1, 1, H, 1, 1] with binary sampling mask (1 = sampled line).
+        num_move: Number of lines to move.
+        center_fraction: Fraction of total height defining protected central band.
+
+    Returns:
+        noise_mask: (same shape) binary where 1 indicates a changed position (line moved).
+        perturbed:  The new perturbed mask.
+        moved_pairs: List of tuples (old_index, new_index).
+    """
+    Bimask = model.module.subsampling.get_mask().clone().view(1, 1, 320, 1, 1)
+    assert Bimask.ndim == 5, "Expected shape [1,1,H,1,1]"
+    _, _, H, _, _ = Bimask.shape
+    if num_move <= 0:
+        return torch.zeros_like(Bimask), Bimask.clone(), []
+
+    # ---- Clone base ----
+    original = Bimask.clone()
+    perturbed = Bimask.clone()
+
+    # ---- Central band definition ----
+    center_line = H // 2
+    band_width = max(1, int(round(H * center_fraction)))
+    # Ensure band_width does not exceed H
+    band_width = min(band_width, H)
+    band_start = center_line - band_width // 2
+    band_end = band_start + band_width
+    band_start = max(0, band_start)
+    band_end = min(H, band_end)
+
+    # Active (sampled) lines
+    active_lines = (original[0, 0, :, 0, 0] == 1).nonzero(as_tuple=False).squeeze(-1)
+    # Candidate lines: outside the protected band
+    candidates = active_lines[
+        (active_lines < band_start) | (active_lines >= band_end)
+    ]
+    if candidates.numel() == 0:
+        return torch.zeros_like(Bimask), Bimask.clone(), []
+    # Compute distance to band boundary
+    # For lines above: distance to band_start
+    # For lines below: distance to (band_end - 1)
+    dist_to_start = torch.abs(candidates - band_start)
+    dist_to_endm1 = torch.abs(candidates - (band_end - 1))
+    distance_to_band = torch.minimum(dist_to_start, dist_to_endm1)
+
+    # Secondary tie-breaker: distance to center line
+    dist_to_center = torch.abs(candidates - center_line)
+
+    # Sort by (distance_to_band, dist_to_center, index)
+    sort_keys = torch.stack([distance_to_band, dist_to_center, candidates.float()], dim=1)
+    # Lexicographic sort: we can convert to tuple of tensors in order
+    # Easiest: sort by a combined key; but stable: use argsort multiple times in reverse order.
+    # Instead build a single scalar key with large multipliers (safe since distances < H)
+    # key = distance_to_band * (H*H) + dist_to_center * H + candidates
+    key = (distance_to_band * (H * H)) + (dist_to_center * H) + candidates
+    order = torch.argsort(key)
+    ordered_candidates = candidates[order]
+
+    # Occupancy tracking
+    occupied = set(active_lines.tolist())
+    protected_set = set(range(band_start, band_end))
+
+    moved_pairs = []
+
+    def find_lowest_free():
+        for idx in range(0, H):
+            if idx in protected_set:
+                continue
+            if idx not in occupied:
+                return idx
+        return None
+
+    def find_highest_free():
+        for idx in range(H - 1, -1, -1):
+            if idx in protected_set:
+                continue
+            if idx not in occupied:
+                return idx
+        return None
+
+    moves_done = 0
+    for y in ordered_candidates.tolist():
+        if moves_done >= num_move:
+            break
+        if y not in occupied:
+            continue  # might already have been moved indirectly (unlikely but safe)
+
+        # Remove current line
+        perturbed[0, 0, y, 0, 0] = 0
+        occupied.remove(y)
+
+        # Decide new extreme position
+        if y < center_line:
+            new_y = find_lowest_free()
+        else:
+            new_y = find_highest_free()
+
+        if new_y is None:
+            # Revert if failed
+            perturbed[0, 0, y, 0, 0] = 1
+            occupied.add(y)
+            continue
+
+        perturbed[0, 0, new_y, 0, 0] = 1
+        occupied.add(new_y)
+        moved_pairs.append((y, new_y))
+        moves_done += 1
+
+    noise_mask = (perturbed != original).float()
+    model.module.subsampling.attack_trajectory_cartesian = noise_mask
+    return None
 
 
 def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     model.train()
     avg_loss = 0.
 
-    if args.inter_gap_mode == "changing_downwards":
-        if epoch < 10:
-            model.module.subsampling.interp_gap = 50
-        elif epoch == 10:
-            model.module.subsampling.interp_gap = 30
-        elif epoch == 15:
-            model.module.subsampling.interp_gap = 20
-        elif epoch == 20:
-            model.module.subsampling.interp_gap = 10
-        elif epoch == 23:
-            model.module.subsampling.interp_gap = 5
-        elif epoch == 25:
-            model.module.subsampling.interp_gap = 1
+    import re
+    mode = args.inter_gap_mode  # e.g., "changing_downwards_20"
+    match = re.search(r'changing_downwards_(\d+)', mode)
+    if match:
+        end_epoch = int(match.group(1))
+        print(f'end_epoch = {end_epoch}')
+    else:
+        raise ValueError(f"Invalid inter_gap_mode format: {mode}")
 
-    if args.inter_gap_mode == "changing_upwards":
-        if epoch < 10:
-            model.module.subsampling.interp_gap = 1
-        elif epoch == 10:
-            model.module.subsampling.interp_gap = 5
-        elif epoch == 15:
-            model.module.subsampling.interp_gap = 10
-        elif epoch == 20:
-            model.module.subsampling.interp_gap = 20
-        elif epoch == 23:
-            model.module.subsampling.interp_gap = 30
-        elif epoch == 25:
-            model.module.subsampling.interp_gap = 50
+    if "changing_downwards" in args.inter_gap_mode:
+        # Define start and end values
+        start_epoch = 0
+        start_gap = args.num_epochs
+        end_gap = 1
+
+        if end_epoch == 0:
+            model.module.subsampling.interp_gap = end_gap
+
+        elif epoch <= end_epoch:
+            # Linear interpolation
+            interp_gap = start_gap + (end_gap - start_gap) * (epoch - start_epoch) / (end_epoch - start_epoch)
+            model.module.subsampling.interp_gap = max(int(interp_gap), end_gap)
+        else:
+            model.module.subsampling.interp_gap = end_gap
+
 
     print("\n", "epochs: ", epoch ," model.module.subsampling.interp_gap: ", model.module.subsampling.interp_gap)
 
@@ -317,16 +472,24 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
             continue
 
         noise = torch.zeros_like(input)
-        if (args.noise_behaviour == "image" or args.noise_behaviour == "noiseImage") and random.random() <= (1 - args.noise_p):
-            print("applied image!")
-            noise = torch.randn_like(input) * args.std_image
+        if ("image" in args.noise_behaviour) and random.random() <= (args.noise_p):
+            print("applied image! ", model.module.noise_model.get_noise())
+            noise = torch.randn_like(input) * model.module.noise_model.get_noise()
 
         input = input + noise
         input = input.to(args.device)
         target = target.to(args.device)
 
-        if args.noise_behaviour == "PGD" or args.noise_behaviour == "PGDANDIMAGE":
-            pgd_attack_with_trajectory(args, model, input, target, model.module.subsampling.epsilon, args.noise_steps)
+        if ('pgd' in args.noise_behaviour) and ('radial' in args.initialization) and (random.random() <= (args.noise_p)):
+            pgd_attack_on_trajectory(model, input, target, model.module.noise_model.get_noise())
+        elif ('pgd' in args.noise_behaviour) and ('radial' in args.initialization):
+            model.module.subsampling.attack_trajectory_radial = None
+
+        if ('pgd' in args.noise_behaviour) and ('cartesian' in args.initialization) and (random.random() <= (args.noise_p)):
+            perturb_Bimask_center_boundary_shift(model, model.module.noise_model.get_noise())
+        elif ('pgd' in args.noise_behaviour) and ('cartesian' in args.initialization):
+            model.module.subsampling.attack_trajectory_cartesian = None
+
 
         output = model(input.unsqueeze(1))
         x = model.module.get_trajectory()
@@ -396,6 +559,9 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         start_iter = time.perf_counter()
     if scheduler:
         scheduler.step()
+
+    model.module.noise_model.step()
+    print("noise level = ", model.module.noise_model.get_noise())
     print(optimizer.param_groups[0]['lr'], (optimizer.param_groups[1]['lr']))
     return avg_loss, time.perf_counter() - start_epoch
 
@@ -453,7 +619,7 @@ def evaluate(args, epoch, model, data_loader, writer):
             text_str = f'PSNR: {psnr_mean:.2f} ± {psnr_std:.2f}\nSSIM: {ssim_mean:.4f} ± {ssim_std:.4f}'
             ax.text(0.05, 0.95, text_str, transform=ax.transAxes, fontsize=12,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            save_dir = f"trajectory/{args.exp_dir}_{args.model}/{args.interp_gap}"
+            save_dir = f"trajectory/{args.exp_dir}_{args.model}"
             os.makedirs(save_dir, exist_ok=True)
             trajectory.savefig(f"{save_dir}/trajectory_epoch_{epoch}.png")
             plt.close(trajectory)
@@ -524,7 +690,7 @@ def visualize(args, epoch, model, data_loader, writer):
             break
 
 
-def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best):
+def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics):
     torch.save(
         {
             'epoch': epoch,
@@ -535,7 +701,8 @@ def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss,
             'best_dev_loss': best_dev_loss,
             'best_psnr_mean': best_psnr_mean,
             'best_ssim_mean': best_ssim_mean,
-            'exp_dir': exp_dir
+            'exp_dir': exp_dir,
+            'metrics': metrics
         },
         f=exp_dir + '/model.pt'
     )
@@ -544,10 +711,6 @@ def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss,
 
 
 def build_model(args):
-    if args.end_epsilon != None and args.epsilon != None:
-        epsilon_step = (args.end_epsilon - args.epsilon)/args.num_epochs
-    else:
-        epsilon_step = 0
 
     model = Subsampling_Model(
         in_chans=args.in_chans,
@@ -569,11 +732,12 @@ def build_model(args):
         num_blocks=args.num_blocks,
         sample_per_shot=args.sample_per_shot,
         epsilon = args.epsilon,
-        epsilon_step = epsilon_step,
-        noise_p = 0 if (args.noise_behaviour != "noiseImage" and args.noise_behaviour != "noise" and args.noise_behaviour != "PGD") else args.noise_p,
+        noise_p = 0 if ("noise" not in args.noise_behaviour) else args.noise_p,
         std = args.std,
         acceleration=args.acceleration,
-        center_fraction=args.center_fraction
+        center_fraction=args.center_fraction,
+        noise = args.noise_behaviour,
+        epochs = args.num_epochs
     ).to(args.device)
     return model
 
@@ -592,8 +756,12 @@ def load_model(checkpoint_file):
 
 
 def build_optim(args, model):
-    optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
-                                  {'params': model.module.reconstruction_model.parameters()}], args.lr)
+    if "decoder" in args.model:
+        optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
+                                  {'params': model.module.reconstruction_model.net.head.parameters()}], args.lr)
+    else:
+        optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
+                                      {'params': model.module.reconstruction_model.parameters()}], args.lr)
     
     return optimizer
 
@@ -605,8 +773,8 @@ def build_scheduler(optimizer, args):
         pct_start= 0.1,  # = 0.1 for 4 warmup epochs
         anneal_strategy='linear',       # linear decay after warmup
         cycle_momentum=False,           # disable momentum scheduling
-        div_factor=10,                   # base_lr = max_lr / div_factor (i.e., start at 0)
-        final_div_factor=10             # decay linearly to ~0
+        div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
+        final_div_factor=1e9            # decay linearly to ~0
     )
     return scheduler
 
@@ -678,7 +846,9 @@ def train():
         if "pretrain" in args.model:
             path = ""
             if "cartesian" in args.model and "vit-l" in args.model:
-                path = "models/vit-l_equidist_acc4/checkpoint.pth"
+                path = "pretrained_models/equidist"
+            elif "radial" in args.model and "vit-l" in args.model:
+                path = "pretrained_models/radial"
             checkpoint = torch.load(path)
             model.module.reconstruction_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer = build_optim(args, model)
@@ -696,23 +866,22 @@ def train():
     train_loader, dev_loader, display_loader = create_data_loaders(args)
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
     print("started mid point", flush=True)
-
-        
+    best_epoch = 0
+    metrics = []
     for epoch in range(start_epoch, args.num_epochs):
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
-        #print("epoch: ", epoch, "current noise level: ", model.module.subsampling.epsilon, "current std: ", model.module.subsampling.std, "started", flush=True)
         train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, scheduler)
         dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer)
-
+        metrics += (dev_loss, dev_time, psnr_mean, ssim_mean)
         if best_psnr_mean < psnr_mean:
             is_new_best = True
             best_psnr_mean = psnr_mean
             best_ssim_mean = ssim_mean
-            best_epoch = epoch + 1
+            best_epoch = epoch
         else:
             is_new_best = False
-        save_model(args, args.exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best)
+        save_model(args, args.exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics)
         logging.info(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
@@ -808,7 +977,7 @@ def create_arg_parser():
     parser.add_argument('--noise-p', type=float, default=0, help='Probability of applying noise during training')
     parser.add_argument('--noise-steps', type=int, default=0, help='The number of PGD steps to apply noise during training')
     parser.add_argument('--std', type=int, default=0, help='The std of the normal noise')
-    parser.add_argument('--std-image', type=int, default=0, help='The std of the normal noise on the image')
+    parser.add_argument('--std-image', type=float, default=0, help='The std of the normal noise on the image')
     parser.add_argument('--acceleration', type=int, default=4, help='The Cartesian Acceleration')
     parser.add_argument('--center-fraction', type=float, default=0.08, help='The Cartesian Center Fraction')
     return parser
