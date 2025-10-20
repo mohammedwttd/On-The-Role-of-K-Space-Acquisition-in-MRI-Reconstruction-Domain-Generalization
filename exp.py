@@ -12,12 +12,12 @@ lr = {
     'Unet': {
         'rec_lr': 5e-4,
         'sub_lr': {
-            'cartesian': 0.05,
+            'cartesian': 0.025,
             'radial': 0.005
         },
         'noise': {
-            'cartesian': 20,
-            'radial': 80,
+            'cartesian': 10,
+            'radial': 30,
             'image': 6e-5,
             'radial_pgd': 1,
             'cartesian_pgd': 4,
@@ -34,12 +34,12 @@ lr = {
     'vit-l-pretrained-cartesian': {
         'rec_lr': 1e-4,
         'sub_lr': {
-            'cartesian': 0.1,
-            'radial': 0.01
+            'cartesian': 0.5,
+            'radial': 0.01 * 3
         },
         'noise': {
-            'cartesian': 20,
-            'radial': 80,
+            'cartesian': 10,
+            'radial': 30,
             'image': 6e-5,
             'radial_pgd': 1,
             'cartesian_pgd': 4,
@@ -49,12 +49,12 @@ lr = {
     'vit-l-pretrained-radial': {
         'rec_lr': 1e-4,
         'sub_lr': {
-            'cartesian': 0.1,
+            'cartesian': 0.5,
             'radial': 0.01
         },
         'noise': {
-            'cartesian': 20,
-            'radial': 80,
+            'cartesian': 10,
+            'radial': 30,
             'image': 6e-5,
             'radial_pgd': 1,
             'cartesian_pgd': 4,
@@ -85,14 +85,15 @@ vel_weight = 0.001
 batch_size = 1
 n_shots = 16
 
-model = 'vit-l-pretrained-cartesian'
-init = 'cartesian'
+model = 'vit-l-pretrained-radial'
+init = 'radial'
 noise = ''
 noise_behaviour = ''
 
-num_epochs = 30 if "pretrained" in model else 40
+num_epochs = 30
 trajectory_learning = 1
-sample_rate = 0.1 if "pretrained" in model else 1
+sample_rate = 0.25
+inter_gap_mode = "changing_downwards_15"
 
 clr = lr[model]
 sub_lr = clr['sub_lr'][init]
@@ -102,7 +103,6 @@ noise_std = clr['noise'][noise] if noise != '' else 0
 TSP = ''
 SNR = ''
 weight_decay = 0
-inter_gap_mode = "changing_downwards_20"
 interp_gap = 10
 acceleration = 4
 center_fraction = 0.08

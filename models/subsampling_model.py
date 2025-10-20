@@ -142,7 +142,7 @@ def save_image(source, folder_path, image_name):
 
 class SubsamplingBinary(nn.Module):
     def initialize_random_mask(self, num_cols, acceleration, center_fraction):
-        rng = np.random.RandomState()
+        rng = np.random.RandomState(42)
         num_low_freqs = int(round(num_cols * center_fraction))
         num_high_freq = int(num_cols / acceleration) - num_low_freqs
         high_freq_mask = rng.uniform(size=(num_cols - num_low_freqs))
@@ -156,7 +156,7 @@ class SubsamplingBinary(nn.Module):
         mask = mask * 0.5 + 0.5 * rng.uniform(size=num_cols)
         return torch.tensor(mask, dtype=torch.float)
 
-    def __init__(self, res, acceleration=4, center_fraction=0.08, momentum=0.9, use_random=False, trajectory_learning = True, noise_cartesian = 0, noise_p = 0, noise_model = None):
+    def __init__(self, res, acceleration=4, center_fraction=0.08, momentum=0.9, use_random=False, trajectory_learning = True, noise_cartesian = 0, noise_p = 0, noise_model = None, adv = False):
         super().__init__()
         self.res = res
         self.acceleration = acceleration
@@ -175,6 +175,7 @@ class SubsamplingBinary(nn.Module):
         self.noise_p = noise_p
         self.noise_model = noise_model
         self.attack_trajectory_cartesian = None
+        self.adv = adv
 
     def get_mask(self):
         res = self.res
@@ -214,6 +215,7 @@ class SubsamplingBinary(nn.Module):
         noise_mask_rand = None
         if self.attack_trajectory_cartesian is not None:
             mask = self.attack_trajectory_cartesian
+            mask = mask.view(1, 1, 320, 1, 1)
             print("applied cartesian noise adv", self.noise_model.get_noise())
 
         elif random.random() < self.noise_p and (self.training) and self.noise_model.get_noise() > 0:
@@ -236,7 +238,10 @@ class SubsamplingBinary(nn.Module):
             return
 
         self.velocity = self.momentum * self.velocity.to("cuda") + (1 - self.momentum) * self.Bimask.grad[0, 0, :, 0, 0]
-        new_mask = self.mask - lr * self.velocity
+        if self.adv:
+            new_mask = self.mask + lr * self.velocity
+        else:
+            new_mask = self.mask - lr * self.velocity
         new_mask = torch.clamp(new_mask, -1, 1)
         self.mask.data = new_mask
 

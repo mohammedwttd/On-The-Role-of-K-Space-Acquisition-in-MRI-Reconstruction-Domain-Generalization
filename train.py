@@ -26,7 +26,7 @@ from models.rec_models.vit_model import VisionTransformer
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from models.subsampling_model import Subsampling_Model
+from models.subsampling_model import Subsampling_Model, SubsamplingBinary
 from scipy.spatial import distance_matrix
 #from tsp_solver.greedy import solve_tsp
 import scipy.io as sio
@@ -112,7 +112,7 @@ def create_datasets(args):
 
 
 def create_data_loaders(args):
-    dev_data, train_data = create_datasets(args)
+    dev_data, train_data = create_datasets(args) 
     display_data = [dev_data[i] for i in range(0, len(dev_data), 1 if len(dev_data) // 16 == 0 else len(dev_data) // 16)]
 
     train_loader = DataLoader(
@@ -135,44 +135,6 @@ def create_data_loaders(args):
         pin_memory=True,
     )
     return train_loader, dev_loader, display_loader
-
-
-def tsp_solver(x):
-    d = distance_matrix(x, x)
-    t = solve_tsp(d)
-    return x[t, :]
-
-def optimize_trajectory(args, model):
-    if not args.trajectory_learning:
-        return
-
-    optimizer = torch.optim.Adam(model.module.parameters(), lr=1e-1)
-    a_max, v_max = args.a_max, args.v_max
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=100,
-                                                           verbose=False)
-
-    x = model.module.get_trajectory()
-    v, a = get_vel_acc(x)
-    init_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, a_max).abs() + 1e-8, 2))) + torch.sqrt(torch.sum(torch.pow(F.softshrink(v, v_max).abs() + 1e-8, 2)))
-    iteration = 0
-    while iteration < 1000:
-        optimizer.zero_grad()
-        x = model.module.get_trajectory()
-        v, a = get_vel_acc(x)
-        acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, a_max).abs() + 1e-8, 2)))
-        vel_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(v, v_max).abs() + 1e-8, 2)))
-        loss = acc_loss + vel_loss
-        loss.backward()
-        optimizer.step()
-
-        if acc_loss.item() <  1e-5 and vel_loss.item() < 1e-5:
-            print(f"acc_loss reached {acc_loss.item()} at iteration {iteration + 1}. Stopping training.")
-            return
-        scheduler.step(loss)
-        iteration += 1
-
-    print("Training completed!, took it from: ", init_loss," to: ", acc_loss + vel_loss)
-
 
 from torch.optim import SGD
 import torch
@@ -302,129 +264,74 @@ def project_l1(perturbation, epsilon):
     projected = torch.sign(x_flat) * torch.clamp(abs_x - theta, min=0)
     return projected.view(original_shape)
 
-def perturb_Bimask_center_boundary_shift(
-    model,
-    num_move: int,
-    center_fraction: float = 0.04,
-):
+def select_top_perturbations_balanced(model, image, target, mask_module, loss_fn, num_bits=3):
     """
-    Move up to `num_move` active lines closest to (but NOT inside) the central fraction band
-    to the extremes of k-space (top or bottom), preserving the center band.
+    Perform one gradient ascent step to find the most harmful perturbations in XOR-space.
 
     Args:
-        Bimask: Tensor shape [1, 1, H, 1, 1] with binary sampling mask (1 = sampled line).
-        num_move: Number of lines to move.
-        center_fraction: Fraction of total height defining protected central band.
+        model: Reconstruction model (e.g., autoencoder).
+        image: Input image tensor.
+        mask_module: BinaryMask instance with .binary_mask.
+        loss_fn: Loss function (e.g., MSELoss).
+        lr: Learning rate for ascent.
+        num_bits: Number of positions to flip in perturbation mask.
 
     Returns:
-        noise_mask: (same shape) binary where 1 indicates a changed position (line moved).
-        perturbed:  The new perturbed mask.
-        moved_pairs: List of tuples (old_index, new_index).
+        perturbation_mask: Float tensor with 1.0 at selected perturbation locations (rest 0.0).
     """
-    Bimask = model.module.subsampling.get_mask().clone().view(1, 1, 320, 1, 1)
-    assert Bimask.ndim == 5, "Expected shape [1,1,H,1,1]"
-    _, _, H, _, _ = Bimask.shape
-    if num_move <= 0:
-        return torch.zeros_like(Bimask), Bimask.clone(), []
+    # Create perturbation mask initialized to 0 (no flips)
+    perturbation_mask = torch.zeros_like(mask_module, dtype=torch.float32, requires_grad=True)
+    # Get the "new" mask: XOR between current binary mask and perturbation mask
+    def xor_masks(m1, m2):
+        return (1 - m1.float()) * m2.float() + m1.float() * (1 - m2.float())  # Differentiable XOR
 
-    # ---- Clone base ----
-    original = Bimask.clone()
-    perturbed = Bimask.clone()
+    new_mask = xor_masks(mask_module.detach(), perturbation_mask).view(1, 1, 320, 1, 1)
 
-    # ---- Central band definition ----
-    center_line = H // 2
-    band_width = max(1, int(round(H * center_fraction)))
-    # Ensure band_width does not exceed H
-    band_width = min(band_width, H)
-    band_start = center_line - band_width // 2
-    band_end = band_start + band_width
-    band_start = max(0, band_start)
-    band_end = min(H, band_end)
+    # Apply the new mask to the image
+    def apply_mask(mask, x):
+        input_c = fastmri.fft2c(x)
+        print(input_c.shape, mask.shape)
+        input_c_masked = input_c.unsqueeze(0) * mask
+        input_c_masked = fastmri.ifft2c(input_c_masked)
+        input_c_masked = transforms.complex_abs(input_c_masked)
+        min_val = input_c_masked.amin(dim=(1, 2, 3), keepdim=True)
+        max_val = input_c_masked.amax(dim=(1, 2, 3), keepdim=True)
+        input_c_masked = (input_c_masked - min_val) / (max_val - min_val + 1e-8)  # Avoid divide-by-zero
+        output = model(input_c_masked)
+        return output
 
-    # Active (sampled) lines
-    active_lines = (original[0, 0, :, 0, 0] == 1).nonzero(as_tuple=False).squeeze(-1)
-    # Candidate lines: outside the protected band
-    candidates = active_lines[
-        (active_lines < band_start) | (active_lines >= band_end)
-    ]
-    if candidates.numel() == 0:
-        return torch.zeros_like(Bimask), Bimask.clone(), []
-    # Compute distance to band boundary
-    # For lines above: distance to band_start
-    # For lines below: distance to (band_end - 1)
-    dist_to_start = torch.abs(candidates - band_start)
-    dist_to_endm1 = torch.abs(candidates - (band_end - 1))
-    distance_to_band = torch.minimum(dist_to_start, dist_to_endm1)
+    masked_recon_image = apply_mask(new_mask, image)
 
-    # Secondary tie-breaker: distance to center line
-    dist_to_center = torch.abs(candidates - center_line)
+    # Compute reconstruction loss
+    loss = loss_fn(masked_recon_image, target)
+    loss.backward()
 
-    # Sort by (distance_to_band, dist_to_center, index)
-    sort_keys = torch.stack([distance_to_band, dist_to_center, candidates.float()], dim=1)
-    # Lexicographic sort: we can convert to tuple of tensors in order
-    # Easiest: sort by a combined key; but stable: use argsort multiple times in reverse order.
-    # Instead build a single scalar key with large multipliers (safe since distances < H)
-    # key = distance_to_band * (H*H) + dist_to_center * H + candidates
-    key = (distance_to_band * (H * H)) + (dist_to_center * H) + candidates
-    order = torch.argsort(key)
-    ordered_candidates = candidates[order]
+    # Get gradient of perturbation_mask
+    grad = perturbation_mask.grad.detach().view(-1)
+    binary_mask_flat = mask_module.view(-1)
 
-    # Occupancy tracking
-    occupied = set(active_lines.tolist())
-    protected_set = set(range(band_start, band_end))
+    # Find top num_bits from where original mask == 1
+    ones_mask = (binary_mask_flat == 1.0)
+    ones_grad = grad.clone()
+    ones_grad[~ones_mask] = float('-inf')  # exclude non-1s
+    top_vals, top_indices = torch.topk(ones_grad, int(num_bits))
 
-    moved_pairs = []
+    # Find bottom num_bits from where original mask == 0
+    zeros_mask = (binary_mask_flat == 0.0)
+    zeros_grad = grad.clone()
+    zeros_grad[~zeros_mask] = float('inf')  # exclude non-0s
+    bottom_vals, bottom_indices = torch.topk(-zeros_grad, int(num_bits))  # negate for lowest
 
-    def find_lowest_free():
-        for idx in range(0, H):
-            if idx in protected_set:
-                continue
-            if idx not in occupied:
-                return idx
-        return None
+    # Merge indices
+    all_indices = torch.cat([top_indices, bottom_indices])
 
-    def find_highest_free():
-        for idx in range(H - 1, -1, -1):
-            if idx in protected_set:
-                continue
-            if idx not in occupied:
-                return idx
-        return None
-
-    moves_done = 0
-    for y in ordered_candidates.tolist():
-        if moves_done >= num_move:
-            break
-        if y not in occupied:
-            continue  # might already have been moved indirectly (unlikely but safe)
-
-        # Remove current line
-        perturbed[0, 0, y, 0, 0] = 0
-        occupied.remove(y)
-
-        # Decide new extreme position
-        if y < center_line:
-            new_y = find_lowest_free()
-        else:
-            new_y = find_highest_free()
-
-        if new_y is None:
-            # Revert if failed
-            perturbed[0, 0, y, 0, 0] = 1
-            occupied.add(y)
-            continue
-
-        perturbed[0, 0, new_y, 0, 0] = 1
-        occupied.add(new_y)
-        moved_pairs.append((y, new_y))
-        moves_done += 1
-
-    noise_mask = (perturbed != original).float()
-    model.module.subsampling.attack_trajectory_cartesian = noise_mask
-    return None
+    # Create final perturbation mask
+    final_mask = torch.zeros_like(perturbation_mask).flatten()
+    final_mask[all_indices] = 1.0
+    return final_mask.view_as(perturbation_mask)
 
 
-def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
+def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask = None):
     model.train()
     avg_loss = 0.
 
@@ -465,6 +372,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     for iter, data in enumerate(data_loader):
         torch.cuda.empty_cache()
         optimizer.zero_grad()
+        optimizer_sub.zero_grad()
             
         input, target, mean, std, norm = data
         if input is None:
@@ -486,7 +394,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
             model.module.subsampling.attack_trajectory_radial = None
 
         if ('pgd' in args.noise_behaviour) and ('cartesian' in args.initialization) and (random.random() <= (args.noise_p)):
-            perturb_Bimask_center_boundary_shift(model, model.module.noise_model.get_noise())
+            model.module.subsampling.attack_trajectory_cartesian = select_top_perturbations_balanced(model.module.reconstruction_model, input, target, model.module.subsampling.get_mask(), F.l1_loss, num_bits=model.module.noise_model.get_noise()).float()
         elif ('pgd' in args.noise_behaviour) and ('cartesian' in args.initialization):
             model.module.subsampling.attack_trajectory_cartesian = None
 
@@ -542,8 +450,9 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
         #print("after backprop:", model.module.subsampling.x)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
         optimizer.step()
+        optimizer_sub.step()
         if args.initialization == 'cartesian':
-            model.module.subsampling.apply_binary_grad(optimizer.param_groups[0]['lr'])
+            model.module.subsampling.apply_binary_grad(optimizer_sub.param_groups[0]['lr'])
         model.module.subsampling.attack_trajectory = None
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
@@ -560,13 +469,19 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer, scheduler):
     if scheduler:
         scheduler.step()
 
+    if scheduler_sub is not None:
+        try:
+            scheduler_sub.step()
+        except ValueError as e:
+            print(f"Skipping scheduler step: {e}")
+
     model.module.noise_model.step()
     print("noise level = ", model.module.noise_model.get_noise())
-    print(optimizer.param_groups[0]['lr'], (optimizer.param_groups[1]['lr']))
+    print(optimizer.param_groups[0]['lr'], (optimizer_sub.param_groups[0]['lr']))
     return avg_loss, time.perf_counter() - start_epoch
 
 
-def evaluate(args, epoch, model, data_loader, writer):
+def evaluate(args, epoch, model, data_loader, writer, adv_mask = None):
     model.eval()
     losses = []
     psnr_l = []
@@ -625,6 +540,18 @@ def evaluate(args, epoch, model, data_loader, writer):
             plt.close(trajectory)
             writer.add_figure('Trajectory', plot_trajectory(x.detach().cpu().numpy()), epoch)
             writer.add_figure('Scatter', plot_scatter(x.detach().cpu().numpy()), epoch)
+
+            if adv_mask:
+                trajectory = plot_trajectory(adv_mask.get_trajectory().detach().cpu().numpy())
+                ax = trajectory.gca()  # Get the current axis from the figure
+                text_str = f'PSNR: {psnr_mean:.2f} ± {psnr_std:.2f}\nSSIM: {ssim_mean:.4f} ± {ssim_std:.4f}'
+                ax.text(0.05, 0.95, text_str, transform=ax.transAxes, fontsize=12,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                save_dir = f"trajectory/{args.exp_dir}_{args.model}"
+                os.makedirs(save_dir, exist_ok=True)
+                trajectory.savefig(f"{save_dir}/trajectory_adv_epoch_{epoch}.png")
+                plt.close(trajectory)
+
         # writer.add_figure('Accelerations_plot', plot_acc(a.cpu().numpy(), args.a_max), epoch)
         # writer.add_figure('Velocity_plot', plot_acc(v.cpu().numpy(), args.v_max), epoch)
         #writer.add_text('Coordinates', str(x.detach().cpu().numpy()).replace(' ', ','), epoch)
@@ -737,7 +664,7 @@ def build_model(args):
         acceleration=args.acceleration,
         center_fraction=args.center_fraction,
         noise = args.noise_behaviour,
-        epochs = args.num_epochs
+        epochs = args.num_epochs,
     ).to(args.device)
     return model
 
@@ -756,19 +683,24 @@ def load_model(checkpoint_file):
 
 
 def build_optim(args, model):
-    if "decoder" in args.model:
-        optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
-                                  {'params': model.module.reconstruction_model.net.head.parameters()}], args.lr)
-    else:
-        optimizer = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr},
-                                      {'params': model.module.reconstruction_model.parameters()}], args.lr)
-    
-    return optimizer
+    optimizer_sub = torch.optim.Adam([{'params': model.module.subsampling.parameters(), 'lr': args.sub_lr}])
+    optimizer = torch.optim.Adam([{'params': model.module.reconstruction_model.parameters()}], args.lr)
+    return optimizer, optimizer_sub
 
-def build_scheduler(optimizer, args):
+def build_scheduler(optimizer, optimizer_sub, args):
+    scheduler_sub = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer_sub,
+        max_lr=[args.sub_lr],  # One per param group
+        total_steps=(args.num_epochs) if "vit-l-pretrained-radial" in args.model else args.num_epochs,    # = 40
+        pct_start= 0.1,  # = 0.1 for 4 warmup epochs
+        anneal_strategy='linear',       # linear decay after warmup
+        cycle_momentum=False,           # disable momentum scheduling
+        div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
+        final_div_factor=1e9            # decay linearly to ~0
+    )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[args.sub_lr, args.lr],  # One per param group
+        max_lr=[args.lr],  # One per param group
         total_steps=args.num_epochs,    # = 40
         pct_start= 0.1,  # = 0.1 for 4 warmup epochs
         anneal_strategy='linear',       # linear decay after warmup
@@ -776,7 +708,7 @@ def build_scheduler(optimizer, args):
         div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
         final_div_factor=1e9            # decay linearly to ~0
     )
-    return scheduler
+    return scheduler, scheduler_sub
 
 
 def eval(args, model, data_loader):
@@ -851,8 +783,8 @@ def train():
                 path = "pretrained_models/radial"
             checkpoint = torch.load(path)
             model.module.reconstruction_model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer = build_optim(args, model)
-        scheduler = build_scheduler(optimizer, args)
+        optimizer, optimizer_sub = build_optim(args, model)
+        scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
 
 
         best_dev_loss = 1e9
@@ -862,7 +794,9 @@ def train():
     inter_gap_mode = args.inter_gap_mode
     noise_behaviour = args.noise_behaviour
     logging.info(args)
-
+    adv_mask = None
+    if "cartesian" and "pgd" in args.noise_behaviour:
+        adv_mask = SubsamplingBinary(320, 100, 0, adv=True).to("cuda")
     train_loader, dev_loader, display_loader = create_data_loaders(args)
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
     print("started mid point", flush=True)
@@ -871,8 +805,8 @@ def train():
     for epoch in range(start_epoch, args.num_epochs):
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer, scheduler)
-        dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer)
+        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask)
+        dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer, adv_mask)
         metrics += (dev_loss, dev_time, psnr_mean, ssim_mean)
         if best_psnr_mean < psnr_mean:
             is_new_best = True
